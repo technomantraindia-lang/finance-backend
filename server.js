@@ -2,6 +2,7 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
 const crypto = require("crypto");
+require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -9,14 +10,23 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "Kuber Finance API",
+    health: "/api/health"
+  });
+});
+
 // ─── Database connection pool ─────────────────────────────
 const pool = mysql.createPool({
-  host: "localhost",
-  user: "transportsoft",
-  password: "YM4EFyph7h48akDj",
-  database: "transportsoft",
+  host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER || "transportsoft",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME || "transportsoft",
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
   queueLimit: 0
 });
 
@@ -31,9 +41,111 @@ const memoryUsers = [
     role: "Admin",
     email: "admin@kuber.local",
     password_hash: "admin123"
+  },
+  {
+    id: "u-customer",
+    name: "Customer",
+    role: "Customer",
+    email: "customer@kuber.local",
+    password_hash: "Kuber@123"
   }
 ];
-const memoryClients = [];
+const memoryClients = [
+  { id: "c-customer", name: "Customer", city: "Ahmedabad", phone: "+919999999999", caller_id: null, password: "Kuber@123" }
+];
+const memoryVehicles = [];
+const memoryDues = [];
+const memoryListings = [];
+const memoryCallerActivities = [];
+const memoryAuditLogs = [];
+const memoryImportRows = [];
+
+function starterRecordsForClient(client) {
+  const suffix = String(client.id).replace(/[^a-z0-9]/gi, "").slice(-6) || Date.now();
+  const truckId = `v-${suffix}-truck`;
+  const trailerId = `v-${suffix}-trailer`;
+  return {
+    vehicles: [
+    {
+      id: truckId,
+      client_id: client.id,
+      type: "Truck",
+      reg_no: "GJ01AB1234",
+      make: "Tata",
+      model: "Prima",
+      year: 2021,
+      km: 68400,
+      principal: 384000,
+      overdue: 28000,
+      penalty: 2500,
+      foreclosure: 15000,
+      insurance_expiry: "2026-09-15",
+      permit_expiry: "2026-10-20",
+      status: "Active"
+    },
+    {
+      id: trailerId,
+      client_id: client.id,
+      type: "Trailer",
+      reg_no: "GJ01TR5678",
+      make: "DICV",
+      model: "Flatbed",
+      year: 2020,
+      km: 52200,
+      principal: 610000,
+      overdue: 0,
+      penalty: 0,
+      foreclosure: 18000,
+      insurance_expiry: "2026-11-05",
+      permit_expiry: "2026-12-12",
+      status: "Listed"
+    }
+    ],
+    dues: [
+    {
+      id: `d-${suffix}-emi`,
+      client_id: client.id,
+      vehicle_id: truckId,
+      type: "EMI",
+      amount: 28000,
+      due_date: "2026-08-25",
+      status: "Due",
+      caller_id: null,
+      priority: "High"
+    },
+    {
+      id: `d-${suffix}-insurance`,
+      client_id: client.id,
+      vehicle_id: truckId,
+      type: "Insurance",
+      amount: 42000,
+      due_date: "2026-09-15",
+      status: "Due",
+      caller_id: null,
+      priority: "Medium"
+    }
+    ],
+    listings: [{
+    id: `m-${suffix}-listing`,
+    vehicle_id: trailerId,
+    title: "2020 DICV Flatbed Trailer",
+    price: 950000,
+    location: client.city || "Ahmedabad",
+    status: "Active",
+    condition_note: "Good"
+    }]
+  };
+}
+
+function createMemoryFleetForClient(client) {
+  if (!client || memoryVehicles.some((vehicle) => vehicle.client_id === client.id)) return;
+  const records = starterRecordsForClient(client);
+  memoryVehicles.push(...records.vehicles);
+  memoryDues.push(...records.dues);
+  memoryListings.push(...records.listings);
+}
+
+memoryClients.forEach(createMemoryFleetForClient);
 
 async function pingDb() {
   try {
@@ -83,7 +195,7 @@ function verifyPassword(password, storedValue) {
 }
 
 let commonPasswordStore = "";
-let commonCustomerPassword = "Kuber@123";
+let commonCustomerPassword = process.env.COMMON_CUSTOMER_PASSWORD || "Kuber@123";
 
 // ─── Common customer password (admin sets this) ───────────
 app.get("/api/common-password", asyncHandler(async (req, res) => {
@@ -158,8 +270,10 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
       return res.status(400).json({ error: "Email already exists." });
     }
+    const client = { id: clientId, name, city: "", phone: "", caller_id: null, password };
     memoryUsers.push({ id, name, role: userRole, email: lowerEmail, password_hash: password });
-    memoryClients.push({ id: clientId, name, city: "", phone: "", caller_id: null, password });
+    memoryClients.push(client);
+    createMemoryFleetForClient(client);
     return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId, mode: "memory" });
   }
 
@@ -174,6 +288,65 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       "INSERT INTO clients (id, name, city, phone, caller_id) VALUES (?, ?, '', '', NULL)",
       [clientId, name]
     );
+    const starter = starterRecordsForClient({ id: clientId, name, city: "", phone: "", caller_id: null });
+    for (const vehicle of starter.vehicles) {
+      await conn.query(
+        `INSERT INTO vehicles
+          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, insurance_expiry, permit_expiry, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          vehicle.id,
+          vehicle.client_id,
+          vehicle.type,
+          vehicle.reg_no,
+          vehicle.make,
+          vehicle.model,
+          vehicle.year,
+          vehicle.km,
+          vehicle.principal,
+          vehicle.overdue,
+          vehicle.penalty,
+          vehicle.foreclosure,
+          vehicle.insurance_expiry,
+          vehicle.permit_expiry,
+          vehicle.status
+        ]
+      );
+    }
+    for (const due of starter.dues) {
+      await conn.query(
+        `INSERT INTO due_tasks
+          (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          due.id,
+          due.client_id,
+          due.vehicle_id,
+          due.type,
+          due.amount,
+          due.due_date,
+          due.status,
+          due.caller_id,
+          due.priority
+        ]
+      );
+    }
+    for (const listing of starter.listings) {
+      await conn.query(
+        `INSERT INTO listings
+          (id, vehicle_id, title, price, location, status, condition_note)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          listing.id,
+          listing.vehicle_id,
+          listing.title,
+          listing.price,
+          listing.location,
+          listing.status,
+          listing.condition_note
+        ]
+      );
+    }
     await conn.commit();
   } catch (err) {
     await conn.rollback();
@@ -193,7 +366,19 @@ app.delete("/api/users/:id", asyncHandler(async (req, res) => {
     if (index === -1) return res.status(404).json({ error: "User not found" });
     const user = memoryUsers[index];
     memoryUsers.splice(index, 1);
-    memoryClients.splice(memoryClients.findIndex((c) => c.id === `c-${user.id.slice(2)}`), 1);
+    const clientId = `c-${user.id.slice(2)}`;
+    const clientIndex = memoryClients.findIndex((c) => c.id === clientId);
+    if (clientIndex >= 0) memoryClients.splice(clientIndex, 1);
+    const vehicleIds = new Set(memoryVehicles.filter((vehicle) => vehicle.client_id === clientId).map((vehicle) => vehicle.id));
+    for (let i = memoryVehicles.length - 1; i >= 0; i -= 1) {
+      if (memoryVehicles[i].client_id === clientId) memoryVehicles.splice(i, 1);
+    }
+    for (let i = memoryDues.length - 1; i >= 0; i -= 1) {
+      if (memoryDues[i].client_id === clientId) memoryDues.splice(i, 1);
+    }
+    for (let i = memoryListings.length - 1; i >= 0; i -= 1) {
+      if (vehicleIds.has(memoryListings[i].vehicle_id)) memoryListings.splice(i, 1);
+    }
     return res.json({ ok: true, id, mode: "memory" });
   }
   await pool.query("DELETE FROM users WHERE id = ?", [id]);
@@ -304,7 +489,7 @@ app.get("/api/clients/:id", asyncHandler(async (req, res) => {
 app.get("/api/vehicles", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryVehicles);
   }
   const [rows] = await pool.query(
     `SELECT v.*, c.name AS client_name
@@ -317,7 +502,9 @@ app.get("/api/vehicles", asyncHandler(async (req, res) => {
 app.get("/api/vehicles/:id", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.status(404).json({ error: "Vehicle not found" });
+    const row = memoryVehicles.find((vehicle) => vehicle.id === req.params.id);
+    if (!row) return res.status(404).json({ error: "Vehicle not found" });
+    return res.json(row);
   }
   const [rows] = await pool.query(
     `SELECT v.*, c.name AS client_name
@@ -334,7 +521,7 @@ app.get("/api/vehicles/:id", asyncHandler(async (req, res) => {
 app.get("/api/dues", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryDues);
   }
   const [rows] = await pool.query(
     `SELECT d.*, c.name AS client_name, v.reg_no AS vehicle_reg_no
@@ -349,7 +536,7 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
 app.get("/api/listings", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryListings);
   }
   const [rows] = await pool.query("SELECT * FROM listings");
   res.json(rows);
@@ -359,7 +546,7 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
 app.get("/api/caller-activities", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryCallerActivities);
   }
   const [rows] = await pool.query("SELECT * FROM caller_activities");
   res.json(rows);
@@ -369,7 +556,7 @@ app.get("/api/caller-activities", asyncHandler(async (req, res) => {
 app.get("/api/audit-logs", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryAuditLogs);
   }
   const [rows] = await pool.query("SELECT * FROM audit_logs");
   res.json(rows);
@@ -379,7 +566,7 @@ app.get("/api/audit-logs", asyncHandler(async (req, res) => {
 app.get("/api/imports", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json([]);
+    return res.json(memoryImportRows);
   }
   const [rows] = await pool.query("SELECT * FROM import_rows");
   res.json(rows);

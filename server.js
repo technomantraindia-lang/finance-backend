@@ -283,6 +283,17 @@ async function ensureClientImportsTable(conn = null) {
   );
 }
 
+async function ensureClientsEmailColumn(conn = null) {
+  if (!dbAvailable) return;
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  try {
+    await query("ALTER TABLE clients ADD COLUMN email VARCHAR(160) AFTER name");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
+}
+
 // Helper to handle async route errors
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
@@ -317,9 +328,11 @@ function normalizeName(value) {
 }
 
 function findMemoryClientForCustomer(email, name) {
+  const lowerEmail = String(email || "").trim().toLowerCase();
   const emailName = normalizeName(customerNameFromEmail(email));
   const userName = normalizeName(name);
   return memoryClients.find((client) => {
+    if (lowerEmail && String(client.email || "").trim().toLowerCase() === lowerEmail) return true;
     const clientName = normalizeName(client.name);
     return clientName && (clientName === emailName || clientName === userName);
   });
@@ -333,7 +346,7 @@ function createMemoryCustomerAccount(email, password) {
     ? `u-${matchedClient.id.slice(2)}`
     : `u-${Date.now()}`;
   const user = { id, name, role: "Customer", email: lowerEmail, password_hash: String(password) };
-  const client = matchedClient ?? { id: `c-${id.slice(2)}`, name, city: "", phone: "", caller_id: null, password: String(password) };
+  const client = matchedClient ?? { id: `c-${id.slice(2)}`, name, email: lowerEmail, city: "", phone: "", caller_id: null, password: String(password) };
   memoryUsers.push(user);
   if (!matchedClient) {
     memoryClients.push(client);
@@ -437,13 +450,14 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
       return res.status(400).json({ error: "Email already exists." });
     }
-    const client = { id: clientId, name, city: "", phone: "", caller_id: null, password };
+    const client = { id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password };
     memoryUsers.push({ id, name, role: userRole, email: lowerEmail, password_hash: password });
     memoryClients.push(client);
     createMemoryFleetForClient(client);
     return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId, mode: "memory" });
   }
 
+  await ensureClientsEmailColumn();
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -452,8 +466,8 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       [id, name, userRole, lowerEmail, password]
     );
     await conn.query(
-      "INSERT INTO clients (id, name, city, phone, caller_id) VALUES (?, ?, '', '', NULL)",
-      [clientId, name]
+      "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
+      [clientId, name, lowerEmail]
     );
     const starter = starterRecordsForClient({ id: clientId, name, city: "", phone: "", caller_id: null });
     for (const vehicle of starter.vehicles) {
@@ -597,11 +611,12 @@ app.post("/api/login", asyncHandler(async (req, res) => {
       mode: "memory"
     });
   }
+  await ensureClientsEmailColumn();
 
   const [rows] = await pool.query(
     `SELECT u.*, c.id AS client_id
      FROM users u
-     LEFT JOIN clients c ON c.id = CONCAT('c-', SUBSTRING(u.id, 3)) OR LOWER(TRIM(c.name)) = LOWER(TRIM(u.name))
+     LEFT JOIN clients c ON c.id = CONCAT('c-', SUBSTRING(u.id, 3)) OR LOWER(TRIM(c.email)) = LOWER(TRIM(u.email)) OR LOWER(TRIM(c.name)) = LOWER(TRIM(u.name))
      WHERE u.email = ?`,
     [lowerEmail]
   );
@@ -649,6 +664,7 @@ app.get("/api/clients", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     return res.json(memoryClients);
   }
+  await ensureClientsEmailColumn();
   const [rows] = await pool.query("SELECT * FROM clients");
   res.json(rows);
 }));
@@ -660,6 +676,7 @@ app.get("/api/clients/:id", asyncHandler(async (req, res) => {
     if (!row) return res.status(404).json({ error: "Client not found" });
     return res.json(row);
   }
+  await ensureClientsEmailColumn();
   const [rows] = await pool.query("SELECT * FROM clients WHERE id = ?", [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: "Client not found" });
   res.json(rows[0]);
@@ -798,20 +815,22 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     });
   }
 
+  await ensureClientsEmailColumn();
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     await ensureClientImportsTable(conn);
     for (const client of clients) {
       await conn.query(
-        `INSERT INTO clients (id, name, city, phone, caller_id)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO clients (id, name, email, city, phone, caller_id)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
+           email = VALUES(email),
            city = VALUES(city),
            phone = VALUES(phone),
            caller_id = VALUES(caller_id)`,
-        [client.id, client.name, client.city, client.phone, client.caller_id]
+        [client.id, client.name, client.email, client.city, client.phone, client.caller_id]
       );
       await ensureCustomerUserForClient(client, conn);
     }

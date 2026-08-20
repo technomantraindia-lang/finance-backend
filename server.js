@@ -241,6 +241,47 @@ function findUserByEmail(email) {
   return memoryUsers.find((u) => u.email === String(email || "").trim().toLowerCase());
 }
 
+function customerNameFromEmail(email) {
+  const local = String(email || "customer").split("@")[0] || "customer";
+  return local
+    .replace(/[._-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim() || "Customer";
+}
+
+function normalizeName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function findMemoryClientForCustomer(email, name) {
+  const emailName = normalizeName(customerNameFromEmail(email));
+  const userName = normalizeName(name);
+  return memoryClients.find((client) => {
+    const clientName = normalizeName(client.name);
+    return clientName && (clientName === emailName || clientName === userName);
+  });
+}
+
+function createMemoryCustomerAccount(email, password) {
+  const lowerEmail = String(email).trim().toLowerCase();
+  const name = customerNameFromEmail(lowerEmail);
+  const matchedClient = findMemoryClientForCustomer(lowerEmail, name);
+  const id = matchedClient?.id?.startsWith("c-")
+    ? `u-${matchedClient.id.slice(2)}`
+    : `u-${Date.now()}`;
+  const user = { id, name, role: "Customer", email: lowerEmail, password_hash: String(password) };
+  const client = matchedClient ?? { id: `c-${id.slice(2)}`, name, city: "", phone: "", caller_id: null, password: String(password) };
+  memoryUsers.push(user);
+  if (!matchedClient) {
+    memoryClients.push(client);
+    createMemoryFleetForClient(client);
+  }
+  return { user, client };
+}
+
 // Supports the scrypt salt:hash format used by seed.sql while remaining
 // compatible with the temporary plaintext passwords created by this build.
 function verifyPassword(password, storedValue) {
@@ -463,8 +504,20 @@ app.post("/api/login", asyncHandler(async (req, res) => {
 
   await pingDb();
   if (!dbAvailable) {
-    const user = memoryUsers.find((u) => u.email === lowerEmail);
+    let user = memoryUsers.find((u) => u.email === lowerEmail);
     if (!user) {
+      if (password === commonPassword) {
+        const created = createMemoryCustomerAccount(lowerEmail, commonPassword);
+        return res.json({
+          id: created.user.id,
+          name: created.user.name,
+          role: created.user.role,
+          email: created.user.email,
+          clientId: created.client.id,
+          needsPasswordChange: true,
+          mode: "memory"
+        });
+      }
       return res.status(401).json({ error: "Invalid email or password." });
     }
     const usingCommon = password === commonPassword;
@@ -472,7 +525,8 @@ app.post("/api/login", asyncHandler(async (req, res) => {
     if (!usingCommon && !usingOwn) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
-    const client = memoryClients.find((c) => c.id === `c-${user.id.slice(2)}`);
+    const client = memoryClients.find((c) => c.id === `c-${user.id.slice(2)}`)
+      ?? findMemoryClientForCustomer(user.email, user.name);
     return res.json({
       id: user.id,
       name: user.name,
@@ -487,7 +541,7 @@ app.post("/api/login", asyncHandler(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT u.*, c.id AS client_id
      FROM users u
-     LEFT JOIN clients c ON c.id = CONCAT('c-', SUBSTRING(u.id, 3))
+     LEFT JOIN clients c ON c.id = CONCAT('c-', SUBSTRING(u.id, 3)) OR LOWER(TRIM(c.name)) = LOWER(TRIM(u.name))
      WHERE u.email = ?`,
     [lowerEmail]
   );

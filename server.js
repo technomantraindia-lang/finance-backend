@@ -6,6 +6,7 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -290,11 +291,30 @@ async function ensureClientsEmailColumn(conn = null) {
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
+app.use("/api", asyncHandler(async (req, res, next) => {
+  if (req.path === "/health") return next();
+  await pingDb();
+  if (REQUIRE_DATABASE && !dbAvailable) {
+    return res.status(503).json({
+      error: "Database connection is not available.",
+      message: "Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME on the deployed backend."
+    });
+  }
+  next();
+}));
+
 // Health check
 app.get("/api/health", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json({ status: "ok", mode: "memory", dbTime: null, message: "MySQL not reachable; using built-in storage." });
+    return res.json({
+      status: REQUIRE_DATABASE ? "error" : "ok",
+      mode: REQUIRE_DATABASE ? "mysql_unavailable" : "memory",
+      dbTime: null,
+      message: REQUIRE_DATABASE
+        ? "MySQL is required but not reachable. Set the deployed database host and credentials."
+        : "MySQL not reachable; using built-in storage."
+    });
   }
   const now = await pool.query("SELECT NOW() AS now");
   res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now });

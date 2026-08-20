@@ -147,6 +147,72 @@ function createMemoryFleetForClient(client) {
 
 memoryClients.forEach(createMemoryFleetForClient);
 
+function upsertMemoryItem(collection, item) {
+  if (!item?.id) return;
+  const index = collection.findIndex((entry) => entry.id === item.id);
+  if (index >= 0) {
+    collection[index] = { ...collection[index], ...item };
+  } else {
+    collection.push(item);
+  }
+}
+
+function normalizeClient(row) {
+  return {
+    id: String(row.id || `c-${Date.now()}`),
+    name: String(row.name || "Customer"),
+    city: row.city || "",
+    phone: row.phone || "",
+    caller_id: row.callerId || row.caller_id || null
+  };
+}
+
+function normalizeVehicle(row) {
+  return {
+    id: String(row.id || `v-${Date.now()}`),
+    client_id: row.clientId || row.client_id || "",
+    type: row.type || "Truck",
+    reg_no: row.regNo || row.reg_no || "",
+    make: row.make || "",
+    model: row.model || "",
+    year: Number(row.year || 0),
+    km: Number(row.km || 0),
+    principal: Number(row.principal || 0),
+    overdue: Number(row.overdue || 0),
+    penalty: Number(row.penalty || 0),
+    foreclosure: Number(row.foreclosure || 0),
+    insurance_expiry: row.insuranceExpiry || row.insurance_expiry || null,
+    permit_expiry: row.permitExpiry || row.permit_expiry || null,
+    status: row.status || "Active"
+  };
+}
+
+function normalizeDue(row) {
+  return {
+    id: String(row.id || `d-${Date.now()}`),
+    client_id: row.clientId || row.client_id || "",
+    vehicle_id: row.vehicleId || row.vehicle_id || null,
+    type: row.type || "EMI",
+    amount: Number(row.amount || 0),
+    due_date: row.dueDate || row.due_date || null,
+    status: row.status || "Due",
+    caller_id: row.callerId || row.caller_id || null,
+    priority: row.priority || "Medium"
+  };
+}
+
+function normalizeListing(row) {
+  return {
+    id: String(row.id || `m-${Date.now()}`),
+    vehicle_id: row.vehicleId || row.vehicle_id || "",
+    title: row.title || "",
+    price: Number(row.price || 0),
+    location: row.location || "",
+    status: row.status || "Submitted",
+    condition_note: row.condition || row.condition_note || "Good"
+  };
+}
+
 async function pingDb() {
   try {
     await pool.query("SELECT 1");
@@ -570,6 +636,125 @@ app.get("/api/imports", asyncHandler(async (req, res) => {
   }
   const [rows] = await pool.query("SELECT * FROM import_rows");
   res.json(rows);
+}));
+
+app.post("/api/sync", asyncHandler(async (req, res) => {
+  const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
+  const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
+  const dueTasks = Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : [];
+  const listings = Array.isArray(req.body?.listings) ? req.body.listings.map(normalizeListing).filter((row) => row.id && row.vehicle_id) : [];
+
+  await pingDb();
+  if (!dbAvailable) {
+    clients.forEach((client) => upsertMemoryItem(memoryClients, client));
+    vehicles.forEach((vehicle) => upsertMemoryItem(memoryVehicles, vehicle));
+    dueTasks.forEach((due) => upsertMemoryItem(memoryDues, due));
+    listings.forEach((listing) => upsertMemoryItem(memoryListings, listing));
+    return res.json({
+      ok: true,
+      mode: "memory",
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length }
+    });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const client of clients) {
+      await conn.query(
+        `INSERT INTO clients (id, name, city, phone, caller_id)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           name = VALUES(name),
+           city = VALUES(city),
+           phone = VALUES(phone),
+           caller_id = VALUES(caller_id)`,
+        [client.id, client.name, client.city, client.phone, client.caller_id]
+      );
+    }
+    for (const vehicle of vehicles) {
+      await conn.query(
+        `INSERT INTO vehicles
+          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, insurance_expiry, permit_expiry, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           client_id = VALUES(client_id),
+           type = VALUES(type),
+           reg_no = VALUES(reg_no),
+           make = VALUES(make),
+           model = VALUES(model),
+           year = VALUES(year),
+           km = VALUES(km),
+           principal = VALUES(principal),
+           overdue = VALUES(overdue),
+           penalty = VALUES(penalty),
+           foreclosure = VALUES(foreclosure),
+           insurance_expiry = VALUES(insurance_expiry),
+           permit_expiry = VALUES(permit_expiry),
+           status = VALUES(status)`,
+        [
+          vehicle.id,
+          vehicle.client_id,
+          vehicle.type,
+          vehicle.reg_no,
+          vehicle.make,
+          vehicle.model,
+          vehicle.year,
+          vehicle.km,
+          vehicle.principal,
+          vehicle.overdue,
+          vehicle.penalty,
+          vehicle.foreclosure,
+          vehicle.insurance_expiry,
+          vehicle.permit_expiry,
+          vehicle.status
+        ]
+      );
+    }
+    for (const due of dueTasks) {
+      await conn.query(
+        `INSERT INTO due_tasks
+          (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           client_id = VALUES(client_id),
+           vehicle_id = VALUES(vehicle_id),
+           type = VALUES(type),
+           amount = VALUES(amount),
+           due_date = VALUES(due_date),
+           status = VALUES(status),
+           caller_id = VALUES(caller_id),
+           priority = VALUES(priority)`,
+        [due.id, due.client_id, due.vehicle_id, due.type, due.amount, due.due_date, due.status, due.caller_id, due.priority]
+      );
+    }
+    for (const listing of listings) {
+      await conn.query(
+        `INSERT INTO listings
+          (id, vehicle_id, title, price, location, status, condition_note)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           vehicle_id = VALUES(vehicle_id),
+           title = VALUES(title),
+           price = VALUES(price),
+           location = VALUES(location),
+           status = VALUES(status),
+           condition_note = VALUES(condition_note)`,
+        [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note]
+      );
+    }
+    await conn.commit();
+    res.json({
+      ok: true,
+      mode: "mysql",
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length }
+    });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
 }));
 
 // Error handler

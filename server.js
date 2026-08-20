@@ -19,15 +19,18 @@ app.get("/", (req, res) => {
 });
 
 // ─── Database connection pool ─────────────────────────────
+const databaseUrl = process.env.DATABASE_URL || process.env.MYSQL_URL || "";
+const databaseConfig = databaseUrl ? new URL(databaseUrl) : null;
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  port: Number(process.env.DB_PORT || 3306),
-  user: process.env.DB_USER || "transportsoft",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "transportsoft",
+  host: databaseConfig?.hostname || process.env.DB_HOST || "localhost",
+  port: Number(databaseConfig?.port || process.env.DB_PORT || 3306),
+  user: databaseConfig ? decodeURIComponent(databaseConfig.username) : (process.env.DB_USER || "transportsoft"),
+  password: databaseConfig ? decodeURIComponent(databaseConfig.password) : (process.env.DB_PASSWORD || ""),
+  database: databaseConfig ? databaseConfig.pathname.replace(/^\//, "") : (process.env.DB_NAME || "transportsoft"),
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
-  queueLimit: 0
+  queueLimit: 0,
+  ssl: process.env.DB_SSL === "true" ? { rejectUnauthorized: false } : undefined
 });
 
 // ─── In-memory fallback (used when MySQL is not running) ──
@@ -41,18 +44,9 @@ const memoryUsers = [
     role: "Admin",
     email: "admin@kuber.local",
     password_hash: "admin123"
-  },
-  {
-    id: "u-customer",
-    name: "Customer",
-    role: "Customer",
-    email: "customer@kuber.local",
-    password_hash: "Kuber@123"
   }
 ];
-const memoryClients = [
-  { id: "c-customer", name: "Customer", city: "Ahmedabad", phone: "+919999999999", caller_id: null, password: "Kuber@123" }
-];
+const memoryClients = [];
 const memoryVehicles = [];
 const memoryDues = [];
 const memoryListings = [];
@@ -145,8 +139,6 @@ function createMemoryFleetForClient(client) {
   memoryDues.push(...records.dues);
   memoryListings.push(...records.listings);
 }
-
-memoryClients.forEach(createMemoryFleetForClient);
 
 function upsertMemoryItem(collection, item) {
   if (!item?.id) return;
@@ -350,7 +342,6 @@ function createMemoryCustomerAccount(email, password) {
   memoryUsers.push(user);
   if (!matchedClient) {
     memoryClients.push(client);
-    createMemoryFleetForClient(client);
   }
   return { user, client };
 }
@@ -453,7 +444,6 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     const client = { id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password };
     memoryUsers.push({ id, name, role: userRole, email: lowerEmail, password_hash: password });
     memoryClients.push(client);
-    createMemoryFleetForClient(client);
     return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId, mode: "memory" });
   }
 
@@ -469,65 +459,6 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
       [clientId, name, lowerEmail]
     );
-    const starter = starterRecordsForClient({ id: clientId, name, city: "", phone: "", caller_id: null });
-    for (const vehicle of starter.vehicles) {
-      await conn.query(
-        `INSERT INTO vehicles
-          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, insurance_expiry, permit_expiry, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          vehicle.id,
-          vehicle.client_id,
-          vehicle.type,
-          vehicle.reg_no,
-          vehicle.make,
-          vehicle.model,
-          vehicle.year,
-          vehicle.km,
-          vehicle.principal,
-          vehicle.overdue,
-          vehicle.penalty,
-          vehicle.foreclosure,
-          vehicle.insurance_expiry,
-          vehicle.permit_expiry,
-          vehicle.status
-        ]
-      );
-    }
-    for (const due of starter.dues) {
-      await conn.query(
-        `INSERT INTO due_tasks
-          (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          due.id,
-          due.client_id,
-          due.vehicle_id,
-          due.type,
-          due.amount,
-          due.due_date,
-          due.status,
-          due.caller_id,
-          due.priority
-        ]
-      );
-    }
-    for (const listing of starter.listings) {
-      await conn.query(
-        `INSERT INTO listings
-          (id, vehicle_id, title, price, location, status, condition_note)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          listing.id,
-          listing.vehicle_id,
-          listing.title,
-          listing.price,
-          listing.location,
-          listing.status,
-          listing.condition_note
-        ]
-      );
-    }
     await conn.commit();
   } catch (err) {
     await conn.rollback();

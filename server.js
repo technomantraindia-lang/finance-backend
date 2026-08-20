@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "25mb" }));
 
 app.get("/", (req, res) => {
   res.json({
@@ -59,6 +59,7 @@ const memoryListings = [];
 const memoryCallerActivities = [];
 const memoryAuditLogs = [];
 const memoryImportRows = [];
+const memoryClientImports = [];
 
 function starterRecordsForClient(client) {
   const suffix = String(client.id).replace(/[^a-z0-9]/gi, "").slice(-6) || Date.now();
@@ -163,7 +164,8 @@ function normalizeClient(row) {
     name: String(row.name || "Customer"),
     city: row.city || "",
     phone: row.phone || "",
-    caller_id: row.callerId || row.caller_id || null
+    caller_id: row.callerId || row.caller_id || null,
+    email: String(row.email || row.loginEmail || "").trim().toLowerCase()
   };
 }
 
@@ -213,6 +215,48 @@ function normalizeListing(row) {
   };
 }
 
+function normalizeClientImport(row) {
+  return {
+    id: String(row.id || `ci-${Date.now()}`),
+    client_id: row.clientId || row.client_id || "",
+    file_name: row.fileName || row.file_name || "Customer import",
+    imported_at: row.importedAt || row.imported_at || new Date().toISOString(),
+    rows: Array.isArray(row.rows) ? row.rows : []
+  };
+}
+
+async function ensureCustomerUserForClient(client, conn = null) {
+  if (!client?.email) return;
+  const commonPassword = await getCommonPassword();
+  const userId = client.id?.startsWith("c-") ? `u-${client.id.slice(2)}` : `u-${Date.now()}`;
+  if (!dbAvailable) {
+    const existing = memoryUsers.find((user) => user.email === client.email);
+    if (existing) {
+      existing.name = client.name;
+      existing.role = existing.role || "Customer";
+      return;
+    }
+    memoryUsers.push({
+      id: userId,
+      name: client.name,
+      role: "Customer",
+      email: client.email,
+      password_hash: commonPassword
+    });
+    return;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `INSERT INTO users (id, name, role, email, password_hash)
+     VALUES (?, ?, 'Customer', ?, ?)
+     ON DUPLICATE KEY UPDATE
+       name = VALUES(name),
+       role = VALUES(role),
+       email = VALUES(email)`,
+    [userId, client.name, client.email, commonPassword]
+  );
+}
+
 async function pingDb() {
   try {
     await pool.query("SELECT 1");
@@ -222,6 +266,22 @@ async function pingDb() {
   }
 }
 pingDb();
+
+async function ensureClientImportsTable(conn = null) {
+  if (!dbAvailable) return;
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS client_imports (
+      id VARCHAR(64) PRIMARY KEY,
+      client_id VARCHAR(32) NOT NULL,
+      file_name VARCHAR(255),
+      imported_at VARCHAR(64),
+      rows_json JSON,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+    )`
+  );
+}
 
 // Helper to handle async route errors
 const asyncHandler = (fn) => (req, res, next) =>
@@ -692,28 +752,56 @@ app.get("/api/imports", asyncHandler(async (req, res) => {
   res.json(rows);
 }));
 
+app.get("/api/client-imports", asyncHandler(async (req, res) => {
+  await pingDb();
+  if (!dbAvailable) {
+    return res.json(memoryClientImports.map((item) => ({
+      id: item.id,
+      clientId: item.client_id,
+      fileName: item.file_name,
+      importedAt: item.imported_at,
+      rows: item.rows
+    })));
+  }
+  await ensureClientImportsTable();
+  const [rows] = await pool.query("SELECT * FROM client_imports ORDER BY created_at DESC");
+  res.json(rows.map((item) => ({
+    id: item.id,
+    clientId: item.client_id,
+    fileName: item.file_name,
+    importedAt: item.imported_at,
+    rows: typeof item.rows_json === "string" ? JSON.parse(item.rows_json || "[]") : (item.rows_json || [])
+  })));
+}));
+
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
   const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
   const dueTasks = Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : [];
   const listings = Array.isArray(req.body?.listings) ? req.body.listings.map(normalizeListing).filter((row) => row.id && row.vehicle_id) : [];
+  const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
 
   await pingDb();
   if (!dbAvailable) {
-    clients.forEach((client) => upsertMemoryItem(memoryClients, client));
+    for (const client of clients) {
+      upsertMemoryItem(memoryClients, client);
+      await ensureCustomerUserForClient(client);
+    }
     vehicles.forEach((vehicle) => upsertMemoryItem(memoryVehicles, vehicle));
     dueTasks.forEach((due) => upsertMemoryItem(memoryDues, due));
     listings.forEach((listing) => upsertMemoryItem(memoryListings, listing));
+    clientImports.forEach((item) => upsertMemoryItem(memoryClientImports, item));
     return res.json({
       ok: true,
       mode: "memory",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, clientImports: clientImports.length }
     });
   }
 
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    await ensureClientImportsTable(conn);
     for (const client of clients) {
       await conn.query(
         `INSERT INTO clients (id, name, city, phone, caller_id)
@@ -725,6 +813,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
            caller_id = VALUES(caller_id)`,
         [client.id, client.name, client.city, client.phone, client.caller_id]
       );
+      await ensureCustomerUserForClient(client, conn);
     }
     for (const vehicle of vehicles) {
       await conn.query(
@@ -797,11 +886,23 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
         [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note]
       );
     }
+    for (const item of clientImports) {
+      await conn.query(
+        `INSERT INTO client_imports (id, client_id, file_name, imported_at, rows_json)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           client_id = VALUES(client_id),
+           file_name = VALUES(file_name),
+           imported_at = VALUES(imported_at),
+           rows_json = VALUES(rows_json)`,
+        [item.id, item.client_id, item.file_name, item.imported_at, JSON.stringify(item.rows)]
+      );
+    }
     await conn.commit();
     res.json({
       ok: true,
       mode: "mysql",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, clientImports: clientImports.length }
     });
   } catch (err) {
     await conn.rollback();

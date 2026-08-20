@@ -126,3 +126,14 @@ CREATE TABLE IF NOT EXISTS import_rows (
   status VARCHAR(32),
   issue VARCHAR(255)
 );
+
+-- Detailed customer Excel uploads used by web, admin app and customer app
+CREATE TABLE IF NOT EXISTS client_imports (
+  id VARCHAR(64) PRIMARY KEY,
+  client_id VARCHAR(32) NOT NULL,
+  file_name VARCHAR(255),
+  imported_at VARCHAR(64),
+  rows_json JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+);

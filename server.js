@@ -19,6 +19,16 @@ const dbSettings = {
   ssl: process.env.DB_SSL === "true" ? { rejectUnauthorized: false } : undefined
 };
 let lastDbError = "";
+let schemaReady = false;
+let schemaPromise = null;
+let clientsEmailReady = false;
+let clientsEmailPromise = null;
+let usersMobileReady = false;
+let usersMobilePromise = null;
+let clientImportsReady = false;
+let clientImportsPromise = null;
+let documentsReady = false;
+let documentsPromise = null;
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -65,6 +75,7 @@ const memoryCallerActivities = [];
 const memoryAuditLogs = [];
 const memoryImportRows = [];
 const memoryClientImports = [];
+const memoryDocuments = [];
 
 function starterRecordsForClient(client) {
   const suffix = String(client.id).replace(/[^a-z0-9]/gi, "").slice(-6) || Date.now();
@@ -172,6 +183,42 @@ function normalizeClient(row) {
   };
 }
 
+function toMysqlDate(value) {
+  const text = String(value || "").trim();
+  const validDate = (year, month, day) => {
+    const date = new Date(Number(year), Number(month) - 1, Number(day));
+    return date.getFullYear() === Number(year) &&
+      date.getMonth() === Number(month) - 1 &&
+      date.getDate() === Number(day);
+  };
+  const buildDate = (year, month, day) => {
+    if (!validDate(year, month, day)) return null;
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  };
+  if (!text || text === "-") return null;
+  const isoMatch = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch;
+    return buildDate(year, month, day);
+  }
+  const localMatch = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (localMatch) {
+    const [, day, month, rawYear] = localMatch;
+    const year = rawYear.length === 2 ? `20${rawYear}` : rawYear;
+    return buildDate(year, month, day);
+  }
+  const namedMonthMatch = text.match(/^(\d{1,2})[-\s]([A-Za-z]{3,})[-\s](\d{2,4})$/);
+  if (namedMonthMatch) {
+    const [, day, monthName, rawYear] = namedMonthMatch;
+    const monthIndex = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(monthName.slice(0, 3).toLowerCase());
+    if (monthIndex >= 0) {
+      const year = rawYear.length === 2 ? `20${rawYear}` : rawYear;
+      return buildDate(year, monthIndex + 1, day);
+    }
+  }
+  return null;
+}
+
 function normalizeVehicle(row) {
   return {
     id: String(row.id || `v-${Date.now()}`),
@@ -186,8 +233,8 @@ function normalizeVehicle(row) {
     overdue: Number(row.overdue || 0),
     penalty: Number(row.penalty || 0),
     foreclosure: Number(row.foreclosure || 0),
-    insurance_expiry: row.insuranceExpiry || row.insurance_expiry || null,
-    permit_expiry: row.permitExpiry || row.permit_expiry || null,
+    insurance_expiry: toMysqlDate(row.insuranceExpiry || row.insurance_expiry),
+    permit_expiry: toMysqlDate(row.permitExpiry || row.permit_expiry),
     status: row.status || "Active"
   };
 }
@@ -199,7 +246,7 @@ function normalizeDue(row) {
     vehicle_id: row.vehicleId || row.vehicle_id || null,
     type: row.type || "EMI",
     amount: Number(row.amount || 0),
-    due_date: row.dueDate || row.due_date || null,
+    due_date: toMysqlDate(row.dueDate || row.due_date),
     status: row.status || "Due",
     caller_id: row.callerId || row.caller_id || null,
     priority: row.priority || "Medium"
@@ -225,6 +272,40 @@ function normalizeClientImport(row) {
     file_name: row.fileName || row.file_name || "Customer import",
     imported_at: row.importedAt || row.imported_at || new Date().toISOString(),
     rows: Array.isArray(row.rows) ? row.rows : []
+  };
+}
+
+function normalizeDocument(row) {
+  return {
+    id: String(row.id || `doc-${Date.now()}`),
+    client_id: row.clientId || row.client_id || "",
+    vehicle_id: row.vehicleId || row.vehicle_id || "",
+    task_id: row.taskId || row.task_id || "",
+    type: row.type || "Other",
+    file_name: row.fileName || row.file_name || "document",
+    mime_type: row.mimeType || row.mime_type || "application/octet-stream",
+    size_bytes: Number(row.size || row.size_bytes || 0),
+    data_url: row.dataUrl || row.data_url || "",
+    uploaded_by: row.uploadedBy || row.uploaded_by || "",
+    uploaded_at: row.uploadedAt || row.uploaded_at || new Date().toLocaleString("en-IN"),
+    note: row.note || ""
+  };
+}
+
+function serializeDocument(row) {
+  return {
+    id: row.id,
+    clientId: row.client_id,
+    vehicleId: row.vehicle_id,
+    taskId: row.task_id,
+    type: row.type,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    size: Number(row.size_bytes || 0),
+    dataUrl: row.data_url,
+    uploadedBy: row.uploaded_by,
+    uploadedAt: row.uploaded_at,
+    note: row.note || ""
   };
 }
 
@@ -330,7 +411,7 @@ async function pingDb() {
   try {
     await pool.query("SELECT 1");
     dbAvailable = true;
-    await ensureCoreTables();
+    await ensureSchemaReady();
     lastDbError = "";
   } catch (error) {
     dbAvailable = false;
@@ -338,6 +419,20 @@ async function pingDb() {
   }
 }
 pingDb();
+
+async function ensureSchemaReady() {
+  if (schemaReady) return;
+  if (!schemaPromise) {
+    schemaPromise = ensureCoreTables()
+      .then(() => {
+        schemaReady = true;
+      })
+      .finally(() => {
+        schemaPromise = null;
+      });
+  }
+  await schemaPromise;
+}
 
 async function ensureCoreTables() {
   await pool.query(
@@ -460,17 +555,29 @@ async function ensureCoreTables() {
   await ensureClientsEmailColumn();
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
+  await ensureDocumentsTable();
   await ensureAdminUser();
 }
 
 async function ensureUsersMobileColumn(conn = null) {
   if (!dbAvailable) return;
+  if (usersMobileReady) return;
+  if (!conn && usersMobilePromise) return usersMobilePromise;
+  if (!conn) {
+    usersMobilePromise = ensureUsersMobileColumn(pool)
+      .finally(() => {
+        usersMobilePromise = null;
+      });
+    return usersMobilePromise;
+  }
   const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
   try {
     await query("ALTER TABLE users ADD COLUMN mobile VARCHAR(24) NULL AFTER email");
+    usersMobileReady = true;
   } catch (error) {
     const message = String(error?.message || "").toLowerCase();
     if (!message.includes("duplicate column")) throw error;
+    usersMobileReady = true;
     // Existing deployments may have mobile as NOT NULL without default; relax it.
     try {
       await query("ALTER TABLE users MODIFY mobile VARCHAR(24) NULL");
@@ -498,6 +605,15 @@ async function ensureAdminUser() {
 
 async function ensureClientImportsTable(conn = null) {
   if (!dbAvailable) return;
+  if (clientImportsReady) return;
+  if (!conn && clientImportsPromise) return clientImportsPromise;
+  if (!conn) {
+    clientImportsPromise = ensureClientImportsTable(pool)
+      .finally(() => {
+        clientImportsPromise = null;
+      });
+    return clientImportsPromise;
+  }
   const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
   await query(
     `CREATE TABLE IF NOT EXISTS client_imports (
@@ -510,16 +626,76 @@ async function ensureClientImportsTable(conn = null) {
       FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
+  const columns = [
+    ["file_name", "ALTER TABLE client_imports ADD COLUMN file_name VARCHAR(255) NULL AFTER client_id"],
+    ["imported_at", "ALTER TABLE client_imports ADD COLUMN imported_at VARCHAR(64) NULL AFTER file_name"],
+    ["rows_json", "ALTER TABLE client_imports ADD COLUMN rows_json JSON NULL AFTER imported_at"]
+  ];
+  for (const [name, statement] of columns) {
+    try {
+      await query(statement);
+    } catch (error) {
+      const message = String(error?.message || "").toLowerCase();
+      if (!message.includes("duplicate column")) throw error;
+    }
+  }
+  clientImportsReady = true;
+}
+
+async function ensureDocumentsTable(conn = null) {
+  if (!dbAvailable) return;
+  if (documentsReady) return;
+  if (!conn && documentsPromise) return documentsPromise;
+  if (!conn) {
+    documentsPromise = ensureDocumentsTable(pool)
+      .finally(() => {
+        documentsPromise = null;
+      });
+    return documentsPromise;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS documents (
+      id VARCHAR(64) PRIMARY KEY,
+      client_id VARCHAR(32),
+      vehicle_id VARCHAR(48),
+      task_id VARCHAR(48),
+      type VARCHAR(64),
+      file_name VARCHAR(255),
+      mime_type VARCHAR(120),
+      size_bytes INT DEFAULT 0,
+      data_url LONGTEXT,
+      uploaded_by VARCHAR(120),
+      uploaded_at VARCHAR(64),
+      note TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_documents_client (client_id),
+      INDEX idx_documents_vehicle (vehicle_id),
+      INDEX idx_documents_task (task_id)
+    )`
+  );
+  documentsReady = true;
 }
 
 async function ensureClientsEmailColumn(conn = null) {
   if (!dbAvailable) return;
+  if (clientsEmailReady) return;
+  if (!conn && clientsEmailPromise) return clientsEmailPromise;
+  if (!conn) {
+    clientsEmailPromise = ensureClientsEmailColumn(pool)
+      .finally(() => {
+        clientsEmailPromise = null;
+      });
+    return clientsEmailPromise;
+  }
   const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
   try {
     await query("ALTER TABLE clients ADD COLUMN email VARCHAR(160) AFTER name");
+    clientsEmailReady = true;
   } catch (error) {
     const message = String(error?.message || "").toLowerCase();
     if (!message.includes("duplicate column")) throw error;
+    clientsEmailReady = true;
   }
 }
 
@@ -533,7 +709,7 @@ app.use("/api", asyncHandler(async (req, res, next) => {
   if (REQUIRE_DATABASE && !dbAvailable) {
     return res.status(503).json({
       error: "Database connection is not available.",
-      message: "Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME on the deployed backend.",
+      message: "Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME in backend/.env.",
       config: {
         host: dbSettings.host,
         port: dbSettings.port,
@@ -1016,6 +1192,78 @@ app.get("/api/client-imports", asyncHandler(async (req, res) => {
   })));
 }));
 
+app.get("/api/documents", asyncHandler(async (req, res) => {
+  await pingDb();
+  if (!dbAvailable) {
+    return res.json(memoryDocuments.map(serializeDocument));
+  }
+  await ensureDocumentsTable();
+  const [rows] = await pool.query("SELECT * FROM documents ORDER BY created_at DESC");
+  res.json(rows.map(serializeDocument));
+}));
+
+app.post("/api/documents", asyncHandler(async (req, res) => {
+  const document = normalizeDocument(req.body || {});
+  if (!document.client_id || !document.vehicle_id || !document.task_id) {
+    return res.status(400).json({ error: "clientId, vehicleId and taskId are required." });
+  }
+  if (!document.data_url) {
+    return res.status(400).json({ error: "Document file content is required." });
+  }
+  await pingDb();
+  if (!dbAvailable) {
+    upsertMemoryItem(memoryDocuments, document);
+    return res.status(201).json(serializeDocument(document));
+  }
+  await ensureDocumentsTable();
+  await pool.query(
+    `INSERT INTO documents
+      (id, client_id, vehicle_id, task_id, type, file_name, mime_type, size_bytes, data_url, uploaded_by, uploaded_at, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       client_id = VALUES(client_id),
+       vehicle_id = VALUES(vehicle_id),
+       task_id = VALUES(task_id),
+       type = VALUES(type),
+       file_name = VALUES(file_name),
+       mime_type = VALUES(mime_type),
+       size_bytes = VALUES(size_bytes),
+       data_url = VALUES(data_url),
+       uploaded_by = VALUES(uploaded_by),
+       uploaded_at = VALUES(uploaded_at),
+       note = VALUES(note)`,
+    [
+      document.id,
+      document.client_id,
+      document.vehicle_id,
+      document.task_id,
+      document.type,
+      document.file_name,
+      document.mime_type,
+      document.size_bytes,
+      document.data_url,
+      document.uploaded_by,
+      document.uploaded_at,
+      document.note
+    ]
+  );
+  res.status(201).json(serializeDocument(document));
+}));
+
+app.delete("/api/documents/:id", asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Document id is required." });
+  await pingDb();
+  if (!dbAvailable) {
+    const index = memoryDocuments.findIndex((document) => document.id === id);
+    if (index >= 0) memoryDocuments.splice(index, 1);
+    return res.json({ ok: true, deleted: id });
+  }
+  await ensureDocumentsTable();
+  await pool.query("DELETE FROM documents WHERE id = ?", [id]);
+  res.json({ ok: true, deleted: id });
+}));
+
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
   const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
@@ -1025,6 +1273,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const auditLogs = Array.isArray(req.body?.auditLogs) ? req.body.auditLogs.map(normalizeAuditLog).filter((row) => row.id) : [];
   const importRows = Array.isArray(req.body?.importRows) ? req.body.importRows.map(normalizeImportRow) : [];
   const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
+  const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
 
   await pingDb();
   if (!dbAvailable) {
@@ -1036,13 +1285,14 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     replaceMemoryCollection(memoryAuditLogs, auditLogs);
     replaceMemoryCollection(memoryImportRows, importRows);
     replaceMemoryCollection(memoryClientImports, clientImports);
+    if (documents) replaceMemoryCollection(memoryDocuments, documents);
     for (const client of clients) {
       await ensureCustomerUserForClient(client);
     }
     return res.json({
       ok: true,
       mode: "memory",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length }
     });
   }
 
@@ -1051,6 +1301,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   try {
     await conn.beginTransaction();
     await ensureClientImportsTable(conn);
+    await ensureDocumentsTable(conn);
     const clientCallerIds = await validUserIdSet(conn, clients);
     const dueCallerIds = await validUserIdSet(conn, dueTasks);
     const activityCallerIds = await validUserIdSet(conn, callerActivities);
@@ -1155,6 +1406,41 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
         [item.id, item.client_id, item.file_name, item.imported_at, JSON.stringify(item.rows)]
       );
     }
+    if (documents) {
+      for (const document of documents) {
+        await conn.query(
+          `INSERT INTO documents
+            (id, client_id, vehicle_id, task_id, type, file_name, mime_type, size_bytes, data_url, uploaded_by, uploaded_at, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             client_id = VALUES(client_id),
+             vehicle_id = VALUES(vehicle_id),
+             task_id = VALUES(task_id),
+             type = VALUES(type),
+             file_name = VALUES(file_name),
+             mime_type = VALUES(mime_type),
+             size_bytes = VALUES(size_bytes),
+             data_url = VALUES(data_url),
+             uploaded_by = VALUES(uploaded_by),
+             uploaded_at = VALUES(uploaded_at),
+             note = VALUES(note)`,
+          [
+            document.id,
+            document.client_id,
+            document.vehicle_id,
+            document.task_id,
+            document.type,
+            document.file_name,
+            document.mime_type,
+            document.size_bytes,
+            document.data_url,
+            document.uploaded_by,
+            document.uploaded_at,
+            document.note
+          ]
+        );
+      }
+    }
     for (const activity of safeCallerActivities) {
       await conn.query(
         `INSERT INTO caller_activities
@@ -1208,7 +1494,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     res.json({
       ok: true,
       mode: "mysql",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0 }
     });
   } catch (err) {
     await conn.rollback();

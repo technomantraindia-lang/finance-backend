@@ -138,3 +138,22 @@ CREATE TABLE IF NOT EXISTS client_imports (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS documents (
+  id VARCHAR(64) PRIMARY KEY,
+  client_id VARCHAR(32),
+  vehicle_id VARCHAR(48),
+  task_id VARCHAR(48),
+  type VARCHAR(64),
+  file_name VARCHAR(255),
+  mime_type VARCHAR(120),
+  size_bytes INT DEFAULT 0,
+  data_url LONGTEXT,
+  uploaded_by VARCHAR(120),
+  uploaded_at VARCHAR(64),
+  note TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_documents_client (client_id),
+  INDEX idx_documents_vehicle (vehicle_id),
+  INDEX idx_documents_task (task_id)
+);

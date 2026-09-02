@@ -72,11 +72,29 @@ CREATE TABLE IF NOT EXISTS listings (
   location VARCHAR(80),
   status VARCHAR(32) DEFAULT 'Submitted',
   condition_note VARCHAR(64) DEFAULT 'Good',
+  photos_json JSON,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
 );
 
 -- ─── Verification Items ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS marketplace_threads (
+  id VARCHAR(64) PRIMARY KEY,
+  listing_id VARCHAR(48) NOT NULL,
+  buyer_client_id VARCHAR(32),
+  seller_client_id VARCHAR(32),
+  status VARCHAR(32) DEFAULT 'Interested',
+  messages_json JSON,
+  reported TINYINT(1) DEFAULT 0,
+  blocked TINYINT(1) DEFAULT 0,
+  updated_at VARCHAR(64),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_marketplace_threads_listing (listing_id),
+  INDEX idx_marketplace_threads_buyer (buyer_client_id),
+  INDEX idx_marketplace_threads_seller (seller_client_id),
+  FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS verification_items (
   id VARCHAR(48) PRIMARY KEY,
   task_id VARCHAR(48) NOT NULL,

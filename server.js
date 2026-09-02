@@ -9,6 +9,10 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
+const DUE_MONITOR_ENABLED = process.env.DUE_MONITOR_ENABLED !== "false";
+const DUE_MONITOR_INTERVAL_HOURS = Math.max(1, Number(process.env.DUE_MONITOR_INTERVAL_HOURS || 24));
+const DUE_MONITOR_WINDOW_DAYS = Math.max(1, Number(process.env.DUE_MONITOR_WINDOW_DAYS || 30));
+const CALLER_ASSIGNMENT_MODE = process.env.CALLER_ASSIGNMENT_MODE || "permanent-client";
 const databaseUrl = process.env.DATABASE_URL || process.env.MYSQL_URL || "";
 const databaseConfig = databaseUrl ? new URL(databaseUrl) : null;
 const dbSettings = {
@@ -29,6 +33,29 @@ let clientImportsReady = false;
 let clientImportsPromise = null;
 let documentsReady = false;
 let documentsPromise = null;
+let marketplaceThreadsReady = false;
+let marketplaceThreadsPromise = null;
+let lastDueMonitorResult = {
+  ok: false,
+  mode: "pending",
+  source: "startup",
+  checkedAt: null,
+  created: 0,
+  updated: 0,
+  scanned: 0,
+  windowDays: DUE_MONITOR_WINDOW_DAYS,
+  error: ""
+};
+let lastCallerAssignmentResult = {
+  ok: false,
+  mode: CALLER_ASSIGNMENT_MODE,
+  source: "startup",
+  checkedAt: null,
+  assigned: 0,
+  skipped: 0,
+  callers: 0,
+  error: ""
+};
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -76,6 +103,20 @@ const memoryAuditLogs = [];
 const memoryImportRows = [];
 const memoryClientImports = [];
 const memoryDocuments = [];
+const memoryMarketplaceThreads = [];
+const defaultRolePermissions = [
+  ["View all clients", "Yes", "No", "Assigned only", "No"],
+  ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
+  ["Import Excel", "Yes", "No", "No", "No"],
+  ["Edit closing principal", "Yes", "No", "No", "No"],
+  ["Mark EMI paid", "Yes", "Own fleet", "No", "Own fleet"],
+  ["Verify payment", "Yes", "No", "No", "No"],
+  ["Call / WhatsApp", "Optional", "No", "Yes", "No"],
+  ["Create sale listing", "Yes", "Yes", "No", "Yes"],
+  ["Approve listing", "Yes", "No", "No", "No"],
+  ["Owner chat", "Reports only", "Yes", "No", "Yes"]
+];
+let rolePermissionsStore = null;
 
 function starterRecordsForClient(client) {
   const suffix = String(client.id).replace(/[^a-z0-9]/gi, "").slice(-6) || Date.now();
@@ -149,7 +190,8 @@ function starterRecordsForClient(client) {
     price: 950000,
     location: client.city || "Ahmedabad",
     status: "Active",
-    condition_note: "Good"
+    condition_note: "Good",
+    photos: []
     }]
   };
 }
@@ -254,6 +296,14 @@ function normalizeDue(row) {
 }
 
 function normalizeListing(row) {
+  let photos = row.photos || row.photos_json || [];
+  if (typeof photos === "string") {
+    try {
+      photos = JSON.parse(photos || "[]");
+    } catch (error) {
+      photos = [];
+    }
+  }
   return {
     id: String(row.id || `m-${Date.now()}`),
     vehicle_id: row.vehicleId || row.vehicle_id || "",
@@ -261,7 +311,8 @@ function normalizeListing(row) {
     price: Number(row.price || 0),
     location: row.location || "",
     status: row.status || "Submitted",
-    condition_note: row.condition || row.condition_note || "Good"
+    condition_note: row.condition || row.condition_note || "Good",
+    photos: Array.isArray(photos) ? photos : []
   };
 }
 
@@ -309,6 +360,43 @@ function serializeDocument(row) {
   };
 }
 
+function normalizeMarketplaceThread(row) {
+  let messages = row.messages || row.messages_json || [];
+  if (typeof messages === "string") {
+    try {
+      messages = JSON.parse(messages || "[]");
+    } catch (error) {
+      messages = [];
+    }
+  }
+  const now = new Date().toLocaleString("en-IN");
+  return {
+    id: String(row.id || `mt-${Date.now()}`),
+    listing_id: row.listingId || row.listing_id || "",
+    buyer_client_id: row.buyerClientId || row.buyer_client_id || "",
+    seller_client_id: row.sellerClientId || row.seller_client_id || "",
+    status: row.status || "Interested",
+    messages: Array.isArray(messages) ? messages : [],
+    reported: Boolean(row.reported),
+    blocked: Boolean(row.blocked),
+    updated_at: row.updatedAt || row.updated_at || now
+  };
+}
+
+function serializeMarketplaceThread(row) {
+  return {
+    id: row.id,
+    listingId: row.listing_id,
+    buyerClientId: row.buyer_client_id,
+    sellerClientId: row.seller_client_id,
+    status: row.status || "Interested",
+    messages: Array.isArray(row.messages) ? row.messages : [],
+    reported: Boolean(row.reported),
+    blocked: Boolean(row.blocked),
+    updatedAt: row.updated_at
+  };
+}
+
 function normalizeCallerActivity(row) {
   return {
     id: String(row.id || `ca-${Date.now()}`),
@@ -353,6 +441,74 @@ function replaceMemoryCollection(collection, rows) {
   collection.splice(0, collection.length, ...rows);
 }
 
+function parseDueDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function formatDateOnly(date) {
+  const parsed = parseDueDate(date);
+  if (!parsed) return "";
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function daysUntil(date, today = new Date()) {
+  const start = parseDueDate(today);
+  const end = parseDueDate(date);
+  if (!start || !end) return null;
+  return Math.round((end.getTime() - start.getTime()) / 86400000);
+}
+
+function dueStatusForDays(days) {
+  return days < 0 ? "Overdue" : "Due";
+}
+
+function duePriorityForDays(days) {
+  if (days < 0 || days <= 7) return "High";
+  if (days <= 15) return "Medium";
+  return "Low";
+}
+
+function autoDueId(vehicleId, type, date) {
+  return `auto-${String(type).toLowerCase()}-${String(vehicleId).replace(/[^a-z0-9]/gi, "")}-${formatDateOnly(parseDueDate(date))}`;
+}
+
+function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, amount = 0 }) {
+  const parsedDate = parseDueDate(date);
+  if (!clientId || !vehicleId || !type || !parsedDate) return null;
+  const days = daysUntil(parsedDate);
+  if (days === null || days > DUE_MONITOR_WINDOW_DAYS) return null;
+  return {
+    id: autoDueId(vehicleId, type, parsedDate),
+    client_id: clientId,
+    vehicle_id: vehicleId,
+    type,
+    amount: Number(amount || 0),
+    due_date: formatDateOnly(parsedDate),
+    status: dueStatusForDays(days),
+    caller_id: callerId || null,
+    priority: duePriorityForDays(days)
+  };
+}
+
+function importRowDueCandidates(row, vehicle, client) {
+  const clientId = vehicle?.client_id || client?.id;
+  const vehicleId = vehicle?.id;
+  return [
+    buildDueCandidate({ clientId, vehicleId, type: "Insurance", date: row.policyEnd, callerId: client?.caller_id }),
+    buildDueCandidate({ clientId, vehicleId, type: "Permit", date: row.permitExpired || row.nationalPermitExpired, callerId: client?.caller_id }),
+    buildDueCandidate({ clientId, vehicleId, type: "Fitness", date: row.fitnessExpired, callerId: client?.caller_id }),
+    buildDueCandidate({ clientId, vehicleId, type: "PUC", date: row.pucExpired, callerId: client?.caller_id }),
+    buildDueCandidate({ clientId, vehicleId, type: "EMI", date: row.emiEnd, callerId: client?.caller_id, amount: Number(String(row.emiAmount || "").replace(/\D/g, "")) || 0 })
+  ].filter(Boolean);
+}
+
 async function validUserIdSet(conn, rows, key = "caller_id") {
   const ids = [...new Set(rows.map((row) => row[key]).filter(Boolean))];
   if (ids.length === 0) return new Set();
@@ -372,6 +528,251 @@ async function deleteMissingRows(conn, table, ids) {
     await conn.query(`DELETE FROM ${table} WHERE id NOT IN (?)`, [ids]);
   } else {
     await conn.query(`DELETE FROM ${table}`);
+  }
+}
+
+async function runMemoryDueDateMonitoring(source = "manual") {
+  const checkedAt = new Date().toISOString();
+  let scanned = 0;
+  let created = 0;
+  let updated = 0;
+  const clientsById = new Map(memoryClients.map((client) => [client.id, client]));
+  const vehiclesByReg = new Map(memoryVehicles.map((vehicle) => [String(vehicle.reg_no || "").replace(/\W/g, "").toLowerCase(), vehicle]));
+  const existingIds = new Set(memoryDues.map((task) => task.id));
+  const candidates = [];
+
+  for (const vehicle of memoryVehicles) {
+    const client = clientsById.get(vehicle.client_id);
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: client?.caller_id }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: client?.caller_id }));
+    scanned += 2;
+  }
+
+  for (const item of memoryClientImports) {
+    const client = clientsById.get(item.client_id);
+    const rows = Array.isArray(item.rows) ? item.rows : [];
+    for (const row of rows) {
+      const vehicle = vehiclesByReg.get(String(row.regNo || "").replace(/\W/g, "").toLowerCase());
+      candidates.push(...importRowDueCandidates(row, vehicle, client));
+      scanned += 5;
+    }
+  }
+
+  for (const candidate of candidates.filter(Boolean)) {
+    if (existingIds.has(candidate.id)) continue;
+    memoryDues.push(candidate);
+    existingIds.add(candidate.id);
+    created += 1;
+  }
+
+  for (const task of memoryDues) {
+    if (["Closed", "Proof Pending", "Verification Pending"].includes(task.status)) continue;
+    const days = daysUntil(task.due_date);
+    if (days === null) continue;
+    const nextStatus = dueStatusForDays(days);
+    const nextPriority = duePriorityForDays(days);
+    if (task.status !== nextStatus || task.priority !== nextPriority) {
+      task.status = nextStatus;
+      task.priority = nextPriority;
+      updated += 1;
+    }
+  }
+
+  lastDueMonitorResult = { ok: true, mode: "memory", source, checkedAt, created, updated, scanned, windowDays: DUE_MONITOR_WINDOW_DAYS, error: "" };
+  return lastDueMonitorResult;
+}
+
+async function runMysqlDueDateMonitoring(source = "manual") {
+  const checkedAt = new Date().toISOString();
+  await ensureClientsEmailColumn();
+  await ensureClientImportsTable();
+  const [vehicles] = await pool.query(
+    `SELECT v.*, c.caller_id
+     FROM vehicles v
+     LEFT JOIN clients c ON c.id = v.client_id`
+  );
+  const [imports] = await pool.query("SELECT * FROM client_imports");
+  const [existingDueRows] = await pool.query("SELECT id, due_date, status, priority FROM due_tasks");
+  const existingIds = new Set(existingDueRows.map((task) => task.id));
+  const vehiclesByReg = new Map(vehicles.map((vehicle) => [String(vehicle.reg_no || "").replace(/\W/g, "").toLowerCase(), vehicle]));
+  const clientsById = new Map(vehicles.map((vehicle) => [vehicle.client_id, { id: vehicle.client_id, caller_id: vehicle.caller_id }]));
+  const candidates = [];
+  let scanned = 0;
+  let created = 0;
+  let updated = 0;
+
+  for (const vehicle of vehicles) {
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: vehicle.caller_id }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: vehicle.caller_id }));
+    scanned += 2;
+  }
+
+  for (const item of imports) {
+    let rows = item.rows_json || [];
+    if (typeof rows === "string") {
+      try {
+        rows = JSON.parse(rows || "[]");
+      } catch (error) {
+        rows = [];
+      }
+    }
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const vehicle = vehiclesByReg.get(String(row.regNo || "").replace(/\W/g, "").toLowerCase());
+      candidates.push(...importRowDueCandidates(row, vehicle, clientsById.get(item.client_id)));
+      scanned += 5;
+    }
+  }
+
+  for (const candidate of candidates.filter(Boolean)) {
+    if (existingIds.has(candidate.id)) continue;
+    await pool.query(
+      `INSERT INTO due_tasks (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [candidate.id, candidate.client_id, candidate.vehicle_id, candidate.type, candidate.amount, candidate.due_date, candidate.status, candidate.caller_id, candidate.priority]
+    );
+    existingIds.add(candidate.id);
+    created += 1;
+  }
+
+  for (const task of existingDueRows) {
+    if (["Closed", "Proof Pending", "Verification Pending"].includes(task.status)) continue;
+    const days = daysUntil(task.due_date);
+    if (days === null) continue;
+    const nextStatus = dueStatusForDays(days);
+    const nextPriority = duePriorityForDays(days);
+    if (task.status !== nextStatus || task.priority !== nextPriority) {
+      await pool.query("UPDATE due_tasks SET status = ?, priority = ? WHERE id = ?", [nextStatus, nextPriority, task.id]);
+      updated += 1;
+    }
+  }
+
+  lastDueMonitorResult = { ok: true, mode: "mysql", source, checkedAt, created, updated, scanned, windowDays: DUE_MONITOR_WINDOW_DAYS, error: "" };
+  return lastDueMonitorResult;
+}
+
+async function runDueDateMonitoring(source = "manual") {
+  await pingDb();
+  try {
+    const result = dbAvailable
+      ? await runMysqlDueDateMonitoring(source)
+      : await runMemoryDueDateMonitoring(source);
+    console.log(`[due-monitor] ${source}: created=${result.created}, updated=${result.updated}, scanned=${result.scanned}`);
+    await runCallerAssignment("due-monitor", CALLER_ASSIGNMENT_MODE);
+    return result;
+  } catch (error) {
+    lastDueMonitorResult = { ...lastDueMonitorResult, ok: false, source, checkedAt: new Date().toISOString(), error: error?.message || String(error) };
+    console.error("[due-monitor] failed:", lastDueMonitorResult.error);
+    throw error;
+  }
+}
+
+function isAssignableDue(task) {
+  return task && !task.caller_id && !["Closed", "Proof Pending", "Verification Pending"].includes(task.status);
+}
+
+function hashString(value) {
+  return String(value || "").split("").reduce((sum, char) => sum + char.charCodeAt(0), 0);
+}
+
+function chooseCallerForTask(task, client, callers, loadByCaller, mode) {
+  if (!callers.length) return null;
+  const validPermanent = client?.caller_id && callers.some((caller) => caller.id === client.caller_id);
+  if (mode === "permanent-client" && validPermanent) return client.caller_id;
+  if (mode === "location-wise") {
+    return callers[hashString(client?.city || client?.name || task.client_id) % callers.length].id;
+  }
+  if (mode === "category-wise") {
+    return callers[hashString(task.type) % callers.length].id;
+  }
+  const sorted = [...callers].sort((first, second) => {
+    const loadDiff = (loadByCaller.get(first.id) || 0) - (loadByCaller.get(second.id) || 0);
+    return loadDiff || String(first.id).localeCompare(String(second.id));
+  });
+  return sorted[0].id;
+}
+
+function normalizeAssignmentMode(mode) {
+  return ["permanent-client", "round-robin", "location-wise", "category-wise"].includes(mode)
+    ? mode
+    : CALLER_ASSIGNMENT_MODE;
+}
+
+async function runMemoryCallerAssignment(source = "manual", requestedMode = CALLER_ASSIGNMENT_MODE) {
+  const checkedAt = new Date().toISOString();
+  const mode = normalizeAssignmentMode(requestedMode);
+  const callers = memoryUsers.filter((user) => user.role === "Caller");
+  const loadByCaller = new Map(callers.map((caller) => [caller.id, memoryDues.filter((task) => task.caller_id === caller.id && task.status !== "Closed").length]));
+  let assigned = 0;
+  let skipped = 0;
+
+  for (const task of memoryDues) {
+    if (!isAssignableDue(task)) {
+      skipped += 1;
+      continue;
+    }
+    const client = memoryClients.find((item) => item.id === task.client_id);
+    const callerId = chooseCallerForTask(task, client, callers, loadByCaller, mode);
+    if (!callerId) {
+      skipped += 1;
+      continue;
+    }
+    task.caller_id = callerId;
+    if (mode === "permanent-client" && client && !client.caller_id) client.caller_id = callerId;
+    loadByCaller.set(callerId, (loadByCaller.get(callerId) || 0) + 1);
+    assigned += 1;
+  }
+
+  lastCallerAssignmentResult = { ok: true, mode, source, checkedAt, assigned, skipped, callers: callers.length, error: "" };
+  return lastCallerAssignmentResult;
+}
+
+async function runMysqlCallerAssignment(source = "manual", requestedMode = CALLER_ASSIGNMENT_MODE) {
+  const checkedAt = new Date().toISOString();
+  const mode = normalizeAssignmentMode(requestedMode);
+  const [callers] = await pool.query("SELECT id, name FROM users WHERE role = 'Caller' ORDER BY id");
+  const [tasks] = await pool.query("SELECT * FROM due_tasks ORDER BY due_date IS NULL, due_date, created_at");
+  const [clients] = await pool.query("SELECT * FROM clients");
+  const clientsById = new Map(clients.map((client) => [client.id, client]));
+  const loadByCaller = new Map(callers.map((caller) => [caller.id, tasks.filter((task) => task.caller_id === caller.id && task.status !== "Closed").length]));
+  let assigned = 0;
+  let skipped = 0;
+
+  for (const task of tasks) {
+    if (!isAssignableDue(task)) {
+      skipped += 1;
+      continue;
+    }
+    const client = clientsById.get(task.client_id);
+    const callerId = chooseCallerForTask(task, client, callers, loadByCaller, mode);
+    if (!callerId) {
+      skipped += 1;
+      continue;
+    }
+    await pool.query("UPDATE due_tasks SET caller_id = ? WHERE id = ?", [callerId, task.id]);
+    if (mode === "permanent-client" && client && !client.caller_id) {
+      await pool.query("UPDATE clients SET caller_id = ? WHERE id = ?", [callerId, client.id]);
+      client.caller_id = callerId;
+    }
+    loadByCaller.set(callerId, (loadByCaller.get(callerId) || 0) + 1);
+    assigned += 1;
+  }
+
+  lastCallerAssignmentResult = { ok: true, mode, source, checkedAt, assigned, skipped, callers: callers.length, error: "" };
+  return lastCallerAssignmentResult;
+}
+
+async function runCallerAssignment(source = "manual", requestedMode = CALLER_ASSIGNMENT_MODE) {
+  await pingDb();
+  try {
+    const result = dbAvailable
+      ? await runMysqlCallerAssignment(source, requestedMode)
+      : await runMemoryCallerAssignment(source, requestedMode);
+    console.log(`[caller-assignment] ${source}: mode=${result.mode}, assigned=${result.assigned}, skipped=${result.skipped}, callers=${result.callers}`);
+    return result;
+  } catch (error) {
+    lastCallerAssignmentResult = { ...lastCallerAssignmentResult, ok: false, source, checkedAt: new Date().toISOString(), error: error?.message || String(error) };
+    console.error("[caller-assignment] failed:", lastCallerAssignmentResult.error);
+    throw error;
   }
 }
 
@@ -502,10 +903,17 @@ async function ensureCoreTables() {
       location VARCHAR(80),
       status VARCHAR(32) DEFAULT 'Submitted',
       condition_note VARCHAR(64) DEFAULT 'Good',
+      photos_json JSON,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
     )`
   );
+  try {
+    await pool.query("ALTER TABLE listings ADD COLUMN photos_json JSON NULL AFTER condition_note");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
   await pool.query(
     `CREATE TABLE IF NOT EXISTS caller_activities (
       id VARCHAR(48) PRIMARY KEY,
@@ -556,6 +964,7 @@ async function ensureCoreTables() {
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
   await ensureDocumentsTable();
+  await ensureMarketplaceThreadsTable();
   await ensureAdminUser();
 }
 
@@ -677,6 +1086,39 @@ async function ensureDocumentsTable(conn = null) {
   documentsReady = true;
 }
 
+async function ensureMarketplaceThreadsTable(conn = null) {
+  if (!dbAvailable) return;
+  if (marketplaceThreadsReady) return;
+  if (!conn && marketplaceThreadsPromise) return marketplaceThreadsPromise;
+  if (!conn) {
+    marketplaceThreadsPromise = ensureMarketplaceThreadsTable(pool)
+      .finally(() => {
+        marketplaceThreadsPromise = null;
+      });
+    return marketplaceThreadsPromise;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS marketplace_threads (
+      id VARCHAR(64) PRIMARY KEY,
+      listing_id VARCHAR(48) NOT NULL,
+      buyer_client_id VARCHAR(32),
+      seller_client_id VARCHAR(32),
+      status VARCHAR(32) DEFAULT 'Interested',
+      messages_json JSON,
+      reported TINYINT(1) DEFAULT 0,
+      blocked TINYINT(1) DEFAULT 0,
+      updated_at VARCHAR(64),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_marketplace_threads_listing (listing_id),
+      INDEX idx_marketplace_threads_buyer (buyer_client_id),
+      INDEX idx_marketplace_threads_seller (seller_client_id),
+      FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE
+    )`
+  );
+  marketplaceThreadsReady = true;
+}
+
 async function ensureClientsEmailColumn(conn = null) {
   if (!dbAvailable) return;
   if (clientsEmailReady) return;
@@ -745,7 +1187,55 @@ app.get("/api/health", asyncHandler(async (req, res) => {
     });
   }
   const now = await pool.query("SELECT NOW() AS now");
-  res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now });
+  res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now, dueMonitor: lastDueMonitorResult, callerAssignment: lastCallerAssignmentResult });
+}));
+
+app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {
+  res.json({
+    enabled: DUE_MONITOR_ENABLED,
+    intervalHours: DUE_MONITOR_INTERVAL_HOURS,
+    windowDays: DUE_MONITOR_WINDOW_DAYS,
+    lastRun: lastDueMonitorResult
+  });
+}));
+
+app.post("/api/due-monitor/run", asyncHandler(async (req, res) => {
+  const result = await runDueDateMonitoring("manual");
+  res.json(result);
+}));
+
+app.get("/api/caller-assignment/status", asyncHandler(async (req, res) => {
+  res.json({
+    defaultMode: CALLER_ASSIGNMENT_MODE,
+    modes: ["permanent-client", "round-robin", "location-wise", "category-wise"],
+    lastRun: lastCallerAssignmentResult
+  });
+}));
+
+app.post("/api/caller-assignment/run", asyncHandler(async (req, res) => {
+  const mode = normalizeAssignmentMode(req.body?.mode || CALLER_ASSIGNMENT_MODE);
+  const result = await runCallerAssignment("manual", mode);
+  res.json(result);
+}));
+
+app.post("/api/caller-assignment/tasks/:id", asyncHandler(async (req, res) => {
+  const taskId = String(req.params.id || "").trim();
+  const callerId = String(req.body?.callerId || "").trim();
+  if (!taskId || !callerId) return res.status(400).json({ error: "task id and callerId are required." });
+  await pingDb();
+  if (!dbAvailable) {
+    const caller = memoryUsers.find((user) => user.id === callerId && user.role === "Caller");
+    const task = memoryDues.find((item) => item.id === taskId);
+    if (!caller) return res.status(404).json({ error: "Caller not found." });
+    if (!task) return res.status(404).json({ error: "Due task not found." });
+    task.caller_id = callerId;
+    return res.json({ ok: true, mode: "memory", taskId, callerId });
+  }
+  const [callers] = await pool.query("SELECT id FROM users WHERE id = ? AND role = 'Caller'", [callerId]);
+  if (!callers.length) return res.status(404).json({ error: "Caller not found." });
+  const [result] = await pool.query("UPDATE due_tasks SET caller_id = ? WHERE id = ?", [callerId, taskId]);
+  if (!result.affectedRows) return res.status(404).json({ error: "Due task not found." });
+  res.json({ ok: true, mode: "mysql", taskId, callerId });
 }));
 
 function findUserByEmail(email) {
@@ -824,7 +1314,8 @@ app.get("/api/common-password", asyncHandler(async (req, res) => {
 
 app.get("/api/settings", asyncHandler(async (req, res) => {
   const value = await getCommonPassword();
-  res.json({ commonCustomerPassword: value });
+  const rolePermissions = await getRolePermissions();
+  res.json({ commonCustomerPassword: value, rolePermissions });
 }));
 
 app.get("/api/common-password-value", asyncHandler(async (req, res) => {
@@ -863,6 +1354,56 @@ app.put("/api/common-password", asyncHandler(async (req, res) => {
 }));
 
 // ─── Users ────────────────────────────────────────────────
+async function getRolePermissions() {
+  if (rolePermissionsStore) return rolePermissionsStore;
+  if (dbAvailable) {
+    try {
+      const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'role_permissions' LIMIT 1");
+      if (rows.length && rows[0].setting_value) {
+        const parsed = JSON.parse(rows[0].setting_value);
+        if (Array.isArray(parsed)) {
+          rolePermissionsStore = parsed;
+          return rolePermissionsStore;
+        }
+      }
+    } catch { /* ignore invalid or missing settings */ }
+  }
+  rolePermissionsStore = defaultRolePermissions;
+  return rolePermissionsStore;
+}
+
+app.get("/api/permissions", asyncHandler(async (req, res) => {
+  const rolePermissions = await getRolePermissions();
+  res.json({ rolePermissions });
+}));
+
+app.put("/api/permissions", asyncHandler(async (req, res) => {
+  const incoming = Array.isArray(req.body?.rolePermissions) ? req.body.rolePermissions : [];
+  const allowedValues = new Set(["Yes", "No", "Assigned only", "Own fleet", "Optional", "Reports only"]);
+  const sanitized = incoming
+    .filter((row) => Array.isArray(row) && row.length >= 5)
+    .map((row) => [
+      String(row[0] || "").trim(),
+      ...row.slice(1, 5).map((value) => allowedValues.has(String(value)) ? String(value) : "No")
+    ])
+    .filter((row) => row[0]);
+
+  if (!sanitized.length) {
+    return res.status(400).json({ error: "Permission rows are required." });
+  }
+
+  rolePermissionsStore = sanitized;
+  if (dbAvailable) {
+    try {
+      await pool.query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES ('role_permissions', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+        [JSON.stringify(rolePermissionsStore)]
+      );
+    } catch { /* table may not exist */ }
+  }
+  res.json({ ok: true, rolePermissions: rolePermissionsStore });
+}));
+
 app.get("/api/users", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
@@ -874,6 +1415,8 @@ app.get("/api/users", asyncHandler(async (req, res) => {
 
 app.post("/api/users", asyncHandler(async (req, res) => {
   const { name, email, password: clientPassword } = req.body;
+  const requestedRole = String(req.body?.role || "Customer");
+  const userRole = ["Customer", "Owner", "Caller"].includes(requestedRole) ? requestedRole : "Customer";
   const commonPassword = await getCommonPassword();
   const password = clientPassword || commonPassword;
   if (!name || !email || !password) {
@@ -881,7 +1424,6 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   }
   const lowerEmail = String(email).trim().toLowerCase();
   const id = `u-${Date.now()}`;
-  const userRole = "Customer";
   const clientId = `c-${id.slice(2)}`;
 
   await pingDb();
@@ -889,10 +1431,12 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
       return res.status(400).json({ error: "Email already exists." });
     }
-    const client = { id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password };
     memoryUsers.push({ id, name, role: userRole, email: lowerEmail, password_hash: password });
-    memoryClients.push(client);
-    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId, mode: "memory" });
+    if (userRole !== "Caller") {
+      const client = { id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password };
+      memoryClients.push(client);
+    }
+    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "memory" });
   }
 
   await ensureClientsEmailColumn();
@@ -903,10 +1447,12 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       "INSERT INTO users (id, name, role, email, password_hash) VALUES (?, ?, ?, ?, ?)",
       [id, name, userRole, lowerEmail, password]
     );
-    await conn.query(
-      "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
-      [clientId, name, lowerEmail]
-    );
+    if (userRole !== "Caller") {
+      await conn.query(
+        "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
+        [clientId, name, lowerEmail]
+      );
+    }
     await conn.commit();
   } catch (err) {
     await conn.rollback();
@@ -914,7 +1460,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   } finally {
     conn.release();
   }
-  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId, mode: "mysql" });
+  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "mysql" });
 }));
 
 // Delete a customer account + client
@@ -1137,7 +1683,7 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
     return res.json(memoryListings);
   }
   const [rows] = await pool.query("SELECT * FROM listings");
-  res.json(rows);
+  res.json(rows.map(normalizeListing));
 }));
 
 // ─── Caller Activities ──────────────────────────────────
@@ -1264,6 +1810,55 @@ app.delete("/api/documents/:id", asyncHandler(async (req, res) => {
   res.json({ ok: true, deleted: id });
 }));
 
+app.get("/api/marketplace-threads", asyncHandler(async (req, res) => {
+  await pingDb();
+  if (!dbAvailable) {
+    return res.json(memoryMarketplaceThreads.map(serializeMarketplaceThread));
+  }
+  await ensureMarketplaceThreadsTable();
+  const [rows] = await pool.query("SELECT * FROM marketplace_threads ORDER BY updated_at DESC");
+  res.json(rows.map((row) => serializeMarketplaceThread(normalizeMarketplaceThread(row))));
+}));
+
+app.post("/api/marketplace-threads", asyncHandler(async (req, res) => {
+  const thread = normalizeMarketplaceThread(req.body || {});
+  if (!thread.listing_id) {
+    return res.status(400).json({ error: "listingId is required." });
+  }
+  await pingDb();
+  if (!dbAvailable) {
+    upsertMemoryItem(memoryMarketplaceThreads, thread);
+    return res.status(201).json(serializeMarketplaceThread(thread));
+  }
+  await ensureMarketplaceThreadsTable();
+  await pool.query(
+    `INSERT INTO marketplace_threads
+      (id, listing_id, buyer_client_id, seller_client_id, status, messages_json, reported, blocked, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       listing_id = VALUES(listing_id),
+       buyer_client_id = VALUES(buyer_client_id),
+       seller_client_id = VALUES(seller_client_id),
+       status = VALUES(status),
+       messages_json = VALUES(messages_json),
+       reported = VALUES(reported),
+       blocked = VALUES(blocked),
+       updated_at = VALUES(updated_at)`,
+    [
+      thread.id,
+      thread.listing_id,
+      thread.buyer_client_id,
+      thread.seller_client_id,
+      thread.status,
+      JSON.stringify(thread.messages),
+      thread.reported ? 1 : 0,
+      thread.blocked ? 1 : 0,
+      thread.updated_at
+    ]
+  );
+  res.status(201).json(serializeMarketplaceThread(thread));
+}));
+
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
   const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
@@ -1274,6 +1869,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const importRows = Array.isArray(req.body?.importRows) ? req.body.importRows.map(normalizeImportRow) : [];
   const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
   const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
+  const marketplaceThreads = Array.isArray(req.body?.marketplaceThreads) ? req.body.marketplaceThreads.map(normalizeMarketplaceThread).filter((row) => row.id && row.listing_id) : null;
 
   await pingDb();
   if (!dbAvailable) {
@@ -1286,13 +1882,14 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     replaceMemoryCollection(memoryImportRows, importRows);
     replaceMemoryCollection(memoryClientImports, clientImports);
     if (documents) replaceMemoryCollection(memoryDocuments, documents);
+    if (marketplaceThreads) replaceMemoryCollection(memoryMarketplaceThreads, marketplaceThreads);
     for (const client of clients) {
       await ensureCustomerUserForClient(client);
     }
     return res.json({
       ok: true,
       mode: "memory",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length, marketplaceThreads: marketplaceThreads?.length ?? memoryMarketplaceThreads.length }
     });
   }
 
@@ -1302,6 +1899,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     await ensureClientImportsTable(conn);
     await ensureDocumentsTable(conn);
+    await ensureMarketplaceThreadsTable(conn);
     const clientCallerIds = await validUserIdSet(conn, clients);
     const dueCallerIds = await validUserIdSet(conn, dueTasks);
     const activityCallerIds = await validUserIdSet(conn, callerActivities);
@@ -1382,16 +1980,17 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     for (const listing of listings) {
       await conn.query(
         `INSERT INTO listings
-          (id, vehicle_id, title, price, location, status, condition_note)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+          (id, vehicle_id, title, price, location, status, condition_note, photos_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            vehicle_id = VALUES(vehicle_id),
            title = VALUES(title),
            price = VALUES(price),
            location = VALUES(location),
            status = VALUES(status),
-           condition_note = VALUES(condition_note)`,
-        [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note]
+           condition_note = VALUES(condition_note),
+           photos_json = VALUES(photos_json)`,
+        [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note, JSON.stringify(listing.photos)]
       );
     }
     for (const item of clientImports) {
@@ -1441,6 +2040,35 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
         );
       }
     }
+    if (marketplaceThreads) {
+      for (const thread of marketplaceThreads) {
+        await conn.query(
+          `INSERT INTO marketplace_threads
+            (id, listing_id, buyer_client_id, seller_client_id, status, messages_json, reported, blocked, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             listing_id = VALUES(listing_id),
+             buyer_client_id = VALUES(buyer_client_id),
+             seller_client_id = VALUES(seller_client_id),
+             status = VALUES(status),
+             messages_json = VALUES(messages_json),
+             reported = VALUES(reported),
+             blocked = VALUES(blocked),
+             updated_at = VALUES(updated_at)`,
+          [
+            thread.id,
+            thread.listing_id,
+            thread.buyer_client_id,
+            thread.seller_client_id,
+            thread.status,
+            JSON.stringify(thread.messages),
+            thread.reported ? 1 : 0,
+            thread.blocked ? 1 : 0,
+            thread.updated_at
+          ]
+        );
+      }
+    }
     for (const activity of safeCallerActivities) {
       await conn.query(
         `INSERT INTO caller_activities
@@ -1486,6 +2114,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await deleteMissingRows(conn, "caller_activities", callerActivities.map((item) => item.id));
     await deleteMissingRows(conn, "audit_logs", auditLogs.map((item) => item.id));
     await deleteMissingRows(conn, "client_imports", clientImports.map((item) => item.id));
+    if (marketplaceThreads) await deleteMissingRows(conn, "marketplace_threads", marketplaceThreads.map((item) => item.id));
     await deleteMissingRows(conn, "listings", listings.map((item) => item.id));
     await deleteMissingRows(conn, "due_tasks", dueTasks.map((item) => item.id));
     await deleteMissingRows(conn, "vehicles", vehicles.map((item) => item.id));
@@ -1494,7 +2123,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     res.json({
       ok: true,
       mode: "mysql",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0 }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0, marketplaceThreads: marketplaceThreads?.length ?? 0 }
     });
   } catch (err) {
     await conn.rollback();
@@ -1510,8 +2139,24 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
+function startDueDateMonitor() {
+  if (!DUE_MONITOR_ENABLED) {
+    console.log("[due-monitor] disabled by DUE_MONITOR_ENABLED=false");
+    return;
+  }
+  const intervalMs = DUE_MONITOR_INTERVAL_HOURS * 60 * 60 * 1000;
+  setTimeout(() => {
+    runDueDateMonitoring("startup").catch(() => {});
+  }, 3000);
+  setInterval(() => {
+    runDueDateMonitoring("scheduled").catch(() => {});
+  }, intervalMs);
+  console.log(`[due-monitor] scheduled every ${DUE_MONITOR_INTERVAL_HOURS} hour(s), window=${DUE_MONITOR_WINDOW_DAYS} day(s)`);
+}
+
 app.listen(PORT, () => {
   console.log(`TransportSoft API running on http://localhost:${PORT}`);
   console.log(`  Database: ${dbAvailable ? "MySQL connected" : "MySQL not reachable — using built-in storage"}`);
   console.log(`  Admin login: admin@kuber.local / admin123`);
+  startDueDateMonitor();
 });

@@ -262,6 +262,16 @@ function toMysqlDate(value) {
 }
 
 function normalizeVehicle(row) {
+  const parseJsonArray = (value) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== "string" || !value.trim()) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
+    }
+  };
   return {
     id: String(row.id || `v-${Date.now()}`),
     client_id: row.clientId || row.client_id || "",
@@ -275,6 +285,18 @@ function normalizeVehicle(row) {
     overdue: Number(row.overdue || 0),
     penalty: Number(row.penalty || 0),
     foreclosure: Number(row.foreclosure || 0),
+    loan_id: String(row.loanId || row.loan_id || "").trim(),
+    loan_account: String(row.loanAccount || row.loan_account || "").trim(),
+    financier: String(row.financier || "").trim(),
+    loan_amount: Number(row.loanAmount || row.loan_amount || 0),
+    emi_amount: Number(row.emiAmount || row.emi_amount || 0),
+    interest_rate: Number(row.interestRate || row.interest_rate || 0),
+    tenure: Number(row.tenure || 0),
+    paid_emi: Number(row.paidEmi || row.paid_emi || 0),
+    emi_start: toMysqlDate(row.emiStart || row.emi_start),
+    emi_end: toMysqlDate(row.emiEnd || row.emi_end),
+    emi_schedule_json: JSON.stringify(parseJsonArray(row.emiSchedule || row.emi_schedule_json)),
+    emi_history_json: JSON.stringify(parseJsonArray(row.emiHistory || row.emi_history_json)),
     insurance_expiry: toMysqlDate(row.insuranceExpiry || row.insurance_expiry),
     permit_expiry: toMysqlDate(row.permitExpiry || row.permit_expiry),
     status: row.status || "Active"
@@ -878,6 +900,7 @@ async function ensureCoreTables() {
       FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
+  await ensureVehicleFinanceColumns();
   await pool.query(
     `CREATE TABLE IF NOT EXISTS due_tasks (
       id VARCHAR(48) PRIMARY KEY,
@@ -966,6 +989,32 @@ async function ensureCoreTables() {
   await ensureDocumentsTable();
   await ensureMarketplaceThreadsTable();
   await ensureAdminUser();
+}
+
+async function ensureVehicleFinanceColumns(conn = null) {
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  const columns = [
+    ["loan_id", "VARCHAR(80) NULL"],
+    ["loan_account", "VARCHAR(80) NULL"],
+    ["financier", "VARCHAR(120) NULL"],
+    ["loan_amount", "DECIMAL(14,2) DEFAULT 0"],
+    ["emi_amount", "DECIMAL(14,2) DEFAULT 0"],
+    ["interest_rate", "DECIMAL(8,4) DEFAULT 0"],
+    ["tenure", "INT DEFAULT 0"],
+    ["paid_emi", "INT DEFAULT 0"],
+    ["emi_start", "DATE NULL"],
+    ["emi_end", "DATE NULL"],
+    ["emi_schedule_json", "LONGTEXT NULL"],
+    ["emi_history_json", "LONGTEXT NULL"]
+  ];
+  for (const [name, definition] of columns) {
+    try {
+      await query(`ALTER TABLE vehicles ADD COLUMN ${name} ${definition}`);
+    } catch (error) {
+      const message = String(error?.message || "").toLowerCase();
+      if (!message.includes("duplicate column")) throw error;
+    }
+  }
 }
 
 async function ensureUsersMobileColumn(conn = null) {
@@ -1924,8 +1973,8 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     for (const vehicle of vehicles) {
       await conn.query(
         `INSERT INTO vehicles
-          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, insurance_expiry, permit_expiry, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_expiry, permit_expiry, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            client_id = VALUES(client_id),
            type = VALUES(type),
@@ -1938,6 +1987,18 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
            overdue = VALUES(overdue),
            penalty = VALUES(penalty),
            foreclosure = VALUES(foreclosure),
+           loan_id = VALUES(loan_id),
+           loan_account = VALUES(loan_account),
+           financier = VALUES(financier),
+           loan_amount = VALUES(loan_amount),
+           emi_amount = VALUES(emi_amount),
+           interest_rate = VALUES(interest_rate),
+           tenure = VALUES(tenure),
+           paid_emi = VALUES(paid_emi),
+           emi_start = VALUES(emi_start),
+           emi_end = VALUES(emi_end),
+           emi_schedule_json = VALUES(emi_schedule_json),
+           emi_history_json = VALUES(emi_history_json),
            insurance_expiry = VALUES(insurance_expiry),
            permit_expiry = VALUES(permit_expiry),
            status = VALUES(status)`,
@@ -1954,6 +2015,18 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
           vehicle.overdue,
           vehicle.penalty,
           vehicle.foreclosure,
+          vehicle.loan_id,
+          vehicle.loan_account,
+          vehicle.financier,
+          vehicle.loan_amount,
+          vehicle.emi_amount,
+          vehicle.interest_rate,
+          vehicle.tenure,
+          vehicle.paid_emi,
+          vehicle.emi_start,
+          vehicle.emi_end,
+          vehicle.emi_schedule_json,
+          vehicle.emi_history_json,
           vehicle.insurance_expiry,
           vehicle.permit_expiry,
           vehicle.status

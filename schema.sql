@@ -171,6 +171,12 @@ CREATE TABLE IF NOT EXISTS import_rows (
   issue VARCHAR(255)
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+  setting_key VARCHAR(120) PRIMARY KEY,
+  setting_value TEXT,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
 -- Detailed customer Excel uploads used by web, admin app and customer app
 CREATE TABLE IF NOT EXISTS client_imports (
   id VARCHAR(64) PRIMARY KEY,

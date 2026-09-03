@@ -35,6 +35,14 @@ let documentsReady = false;
 let documentsPromise = null;
 let marketplaceThreadsReady = false;
 let marketplaceThreadsPromise = null;
+const defaultReminderSettings = {
+  enabled: DUE_MONITOR_ENABLED,
+  intervalHours: DUE_MONITOR_INTERVAL_HOURS,
+  windowDays: DUE_MONITOR_WINDOW_DAYS
+};
+let reminderSettingsStore = { ...defaultReminderSettings };
+let dueMonitorTimer = null;
+let dueMonitorStartupTimer = null;
 let lastDueMonitorResult = {
   ok: false,
   mode: "pending",
@@ -117,6 +125,36 @@ const defaultRolePermissions = [
   ["Owner chat", "Reports only", "Yes", "No", "Yes"]
 ];
 let rolePermissionsStore = null;
+
+function sanitizeReminderSettings(input = {}) {
+  const enabled = typeof input.enabled === "boolean"
+    ? input.enabled
+    : String(input.enabled ?? "true").toLowerCase() !== "false";
+  const intervalHours = Math.min(168, Math.max(1, Math.round(Number(input.intervalHours ?? defaultReminderSettings.intervalHours) || defaultReminderSettings.intervalHours)));
+  const windowDays = Math.min(180, Math.max(1, Math.round(Number(input.windowDays ?? defaultReminderSettings.windowDays) || defaultReminderSettings.windowDays)));
+  return { enabled, intervalHours, windowDays };
+}
+
+function currentReminderSettings() {
+  return reminderSettingsStore;
+}
+
+async function loadReminderSettingsFromDatabase() {
+  try {
+    const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'reminder_settings' LIMIT 1");
+    if (rows.length && rows[0].setting_value) {
+      try {
+        reminderSettingsStore = sanitizeReminderSettings(JSON.parse(rows[0].setting_value));
+        return reminderSettingsStore;
+      } catch { /* use defaults when the stored value is invalid */ }
+    }
+    await pool.query(
+      "INSERT INTO settings (setting_key, setting_value) VALUES ('reminder_settings', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+      [JSON.stringify(reminderSettingsStore)]
+    );
+  } catch { /* settings are optional while the database is unavailable */ }
+  return reminderSettingsStore;
+}
 
 function starterRecordsForClient(client) {
   const suffix = String(client.id).replace(/[^a-z0-9]/gi, "").slice(-6) || Date.now();
@@ -459,6 +497,65 @@ function normalizeAuditLog(row) {
   };
 }
 
+function buildBackendNextCycleDueTask(task, vehicle) {
+  if (!task || !vehicle || task.status !== "Closed") return null;
+  const currentDate = parseDueDate(task.due_date);
+  if (!currentDate) return null;
+  let nextDate = null;
+  let amount = Number(task.amount || 0);
+  if (task.type === "EMI") {
+    let schedule = vehicle.emi_schedule_json || [];
+    if (typeof schedule === "string") {
+      try { schedule = JSON.parse(schedule || "[]"); } catch { schedule = []; }
+    }
+    const nextSchedule = (Array.isArray(schedule) ? schedule : [])
+      .filter((entry) => entry.status !== "Paid")
+      .map((entry) => ({ entry, date: parseDueDate(entry.dueDate) }))
+      .filter(({ date }) => date && date > currentDate)
+      .sort((left, right) => left.date - right.date)[0];
+    nextDate = nextSchedule?.date || new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, currentDate.getDate());
+    amount = Number(nextSchedule?.entry?.amount || vehicle.emi_amount || task.amount || 0);
+    if (!nextSchedule && vehicle.tenure && Number(vehicle.paid_emi || 0) >= Number(vehicle.tenure)) return null;
+  } else if (["Insurance", "Permit", "Fitness", "PUC", "Tax"].includes(task.type)) {
+    nextDate = new Date(currentDate.getFullYear() + 1, currentDate.getMonth(), currentDate.getDate());
+  }
+  if (!nextDate || Number.isNaN(nextDate.getTime())) return null;
+  const dueDate = formatDateOnly(nextDate);
+  const days = daysUntil(nextDate);
+  const priority = days <= 7 ? "High" : days <= 15 ? "Medium" : "Low";
+  const vehicleKey = String(vehicle.id).replace(/[^a-z0-9]/gi, "");
+  return {
+    id: `auto-${task.type.toLowerCase()}-${vehicleKey}-${dueDate}`,
+    client_id: task.client_id,
+    vehicle_id: task.vehicle_id,
+    type: task.type,
+    amount,
+    due_date: dueDate,
+    status: "Due",
+    caller_id: task.caller_id || null,
+    priority
+  };
+}
+
+function appendApprovedNextCycleTasks(dueTasks, vehicles, auditLogs) {
+  const approvedIds = new Set(auditLogs
+    .filter((log) => log.module === "Verification" && log.action === "Approved")
+    .map((log) => log.record));
+  const vehiclesById = new Map(vehicles.map((vehicle) => [vehicle.id, vehicle]));
+  const existingKeys = new Set(dueTasks.map((task) => `${task.vehicle_id}:${task.type}:${task.due_date}`));
+  const generated = [];
+  for (const task of dueTasks) {
+    if (!approvedIds.has(task.id)) continue;
+    const nextTask = buildBackendNextCycleDueTask(task, vehiclesById.get(task.vehicle_id));
+    const key = nextTask && `${nextTask.vehicle_id}:${nextTask.type}:${nextTask.due_date}`;
+    if (nextTask && !existingKeys.has(key)) {
+      generated.push(nextTask);
+      existingKeys.add(key);
+    }
+  }
+  return [...dueTasks, ...generated];
+}
+
 function normalizeImportRow(row) {
   return {
     row_no: Number(row.row || row.row_no || 0),
@@ -518,7 +615,7 @@ function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, a
   const parsedDate = parseDueDate(date);
   if (!clientId || !vehicleId || !type || !parsedDate) return null;
   const days = daysUntil(parsedDate);
-  if (days === null || days > DUE_MONITOR_WINDOW_DAYS) return null;
+  if (days === null || days > currentReminderSettings().windowDays) return null;
   return {
     id: autoDueId(vehicleId, type, parsedDate),
     client_id: clientId,
@@ -613,7 +710,7 @@ async function runMemoryDueDateMonitoring(source = "manual") {
     }
   }
 
-  lastDueMonitorResult = { ok: true, mode: "memory", source, checkedAt, created, updated, scanned, windowDays: DUE_MONITOR_WINDOW_DAYS, error: "" };
+  lastDueMonitorResult = { ok: true, mode: "memory", source, checkedAt, created, updated, scanned, windowDays: currentReminderSettings().windowDays, error: "" };
   return lastDueMonitorResult;
 }
 
@@ -681,7 +778,7 @@ async function runMysqlDueDateMonitoring(source = "manual") {
     }
   }
 
-  lastDueMonitorResult = { ok: true, mode: "mysql", source, checkedAt, created, updated, scanned, windowDays: DUE_MONITOR_WINDOW_DAYS, error: "" };
+  lastDueMonitorResult = { ok: true, mode: "mysql", source, checkedAt, created, updated, scanned, windowDays: currentReminderSettings().windowDays, error: "" };
   return lastDueMonitorResult;
 }
 
@@ -1001,6 +1098,7 @@ async function ensureCoreTables() {
   await ensureClientImportsTable();
   await ensureDocumentsTable();
   await ensureMarketplaceThreadsTable();
+  await loadReminderSettingsFromDatabase();
   await ensureAdminUser();
 }
 
@@ -1266,10 +1364,10 @@ app.get("/api/health", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {
+  const reminderSettings = currentReminderSettings();
   res.json({
-    enabled: DUE_MONITOR_ENABLED,
-    intervalHours: DUE_MONITOR_INTERVAL_HOURS,
-    windowDays: DUE_MONITOR_WINDOW_DAYS,
+    ...reminderSettings,
+    reminderSettings,
     lastRun: lastDueMonitorResult
   });
 }));
@@ -1295,20 +1393,23 @@ app.post("/api/caller-assignment/run", asyncHandler(async (req, res) => {
 
 app.post("/api/caller-assignment/tasks/:id", asyncHandler(async (req, res) => {
   const taskId = String(req.params.id || "").trim();
-  const callerId = String(req.body?.callerId || "").trim();
-  if (!taskId || !callerId) return res.status(400).json({ error: "task id and callerId are required." });
+  const callerId = String(req.body?.callerId ?? "").trim();
+  if (!taskId) return res.status(400).json({ error: "task id is required." });
   await pingDb();
   if (!dbAvailable) {
-    const caller = memoryUsers.find((user) => user.id === callerId && user.role === "Caller");
     const task = memoryDues.find((item) => item.id === taskId);
-    if (!caller) return res.status(404).json({ error: "Caller not found." });
     if (!task) return res.status(404).json({ error: "Due task not found." });
-    task.caller_id = callerId;
+    if (callerId && !memoryUsers.some((user) => user.id === callerId && user.role === "Caller")) {
+      return res.status(404).json({ error: "Caller not found." });
+    }
+    task.caller_id = callerId || null;
     return res.json({ ok: true, mode: "memory", taskId, callerId });
   }
-  const [callers] = await pool.query("SELECT id FROM users WHERE id = ? AND role = 'Caller'", [callerId]);
-  if (!callers.length) return res.status(404).json({ error: "Caller not found." });
-  const [result] = await pool.query("UPDATE due_tasks SET caller_id = ? WHERE id = ?", [callerId, taskId]);
+  if (callerId) {
+    const [callers] = await pool.query("SELECT id FROM users WHERE id = ? AND role = 'Caller'", [callerId]);
+    if (!callers.length) return res.status(404).json({ error: "Caller not found." });
+  }
+  const [result] = await pool.query("UPDATE due_tasks SET caller_id = ? WHERE id = ?", [callerId || null, taskId]);
   if (!result.affectedRows) return res.status(404).json({ error: "Due task not found." });
   res.json({ ok: true, mode: "mysql", taskId, callerId });
 }));
@@ -1390,7 +1491,27 @@ app.get("/api/common-password", asyncHandler(async (req, res) => {
 app.get("/api/settings", asyncHandler(async (req, res) => {
   const value = await getCommonPassword();
   const rolePermissions = await getRolePermissions();
-  res.json({ commonCustomerPassword: value, rolePermissions });
+  res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings() });
+}));
+
+app.get("/api/reminder-settings", asyncHandler(async (req, res) => {
+  await pingDb();
+  res.json(currentReminderSettings());
+}));
+
+app.put("/api/reminder-settings", asyncHandler(async (req, res) => {
+  const nextSettings = sanitizeReminderSettings(req.body || {});
+  reminderSettingsStore = nextSettings;
+  if (dbAvailable) {
+    try {
+      await pool.query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES ('reminder_settings', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+        [JSON.stringify(nextSettings)]
+      );
+    } catch { /* keep runtime settings when the optional settings table is unavailable */ }
+  }
+  startDueDateMonitor();
+  res.json({ ok: true, reminderSettings: currentReminderSettings() });
 }));
 
 app.get("/api/common-password-value", asyncHandler(async (req, res) => {
@@ -1937,7 +2058,7 @@ app.post("/api/marketplace-threads", asyncHandler(async (req, res) => {
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
   const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
-  const dueTasks = Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : [];
+  const incomingDueTasks = Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : [];
   const listings = Array.isArray(req.body?.listings) ? req.body.listings.map(normalizeListing).filter((row) => row.id && row.vehicle_id) : [];
   const callerActivities = Array.isArray(req.body?.callerActivities) ? req.body.callerActivities.map(normalizeCallerActivity).filter((row) => row.id && row.task_id) : [];
   const auditLogs = Array.isArray(req.body?.auditLogs) ? req.body.auditLogs.map(normalizeAuditLog).filter((row) => row.id) : [];
@@ -1945,6 +2066,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
   const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
   const marketplaceThreads = Array.isArray(req.body?.marketplaceThreads) ? req.body.marketplaceThreads.map(normalizeMarketplaceThread).filter((row) => row.id && row.listing_id) : null;
+  const dueTasks = appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs);
 
   await pingDb();
   if (!dbAvailable) {
@@ -2265,18 +2387,28 @@ app.use((err, req, res, next) => {
 });
 
 function startDueDateMonitor() {
-  if (!DUE_MONITOR_ENABLED) {
-    console.log("[due-monitor] disabled by DUE_MONITOR_ENABLED=false");
+  const settings = currentReminderSettings();
+  if (dueMonitorStartupTimer) {
+    clearTimeout(dueMonitorStartupTimer);
+    dueMonitorStartupTimer = null;
+  }
+  if (dueMonitorTimer) {
+    clearInterval(dueMonitorTimer);
+    dueMonitorTimer = null;
+  }
+  if (!settings.enabled) {
+    console.log("[due-monitor] disabled by reminder settings");
     return;
   }
-  const intervalMs = DUE_MONITOR_INTERVAL_HOURS * 60 * 60 * 1000;
-  setTimeout(() => {
+  const intervalMs = settings.intervalHours * 60 * 60 * 1000;
+  dueMonitorStartupTimer = setTimeout(() => {
+    dueMonitorStartupTimer = null;
     runDueDateMonitoring("startup").catch(() => {});
   }, 3000);
-  setInterval(() => {
+  dueMonitorTimer = setInterval(() => {
     runDueDateMonitoring("scheduled").catch(() => {});
   }, intervalMs);
-  console.log(`[due-monitor] scheduled every ${DUE_MONITOR_INTERVAL_HOURS} hour(s), window=${DUE_MONITOR_WINDOW_DAYS} day(s)`);
+  console.log(`[due-monitor] scheduled every ${settings.intervalHours} hour(s), window=${settings.windowDays} day(s)`);
 }
 
 app.listen(PORT, () => {

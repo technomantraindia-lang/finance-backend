@@ -1959,21 +1959,9 @@ app.post("/api/documents", asyncHandler(async (req, res) => {
   }
   await ensureDocumentsTable();
   await pool.query(
-    `INSERT INTO documents
+    `REPLACE INTO documents
       (id, client_id, vehicle_id, task_id, type, file_name, mime_type, size_bytes, data_url, uploaded_by, uploaded_at, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       client_id = VALUES(client_id),
-       vehicle_id = VALUES(vehicle_id),
-       task_id = VALUES(task_id),
-       type = VALUES(type),
-       file_name = VALUES(file_name),
-       mime_type = VALUES(mime_type),
-       size_bytes = VALUES(size_bytes),
-       data_url = VALUES(data_url),
-       uploaded_by = VALUES(uploaded_by),
-       uploaded_at = VALUES(uploaded_at),
-       note = VALUES(note)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       document.id,
       document.client_id,
@@ -2120,49 +2108,9 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     }
     for (const vehicle of vehicles) {
       await conn.query(
-        `INSERT INTO vehicles
+        `REPLACE INTO vehicles
           (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, combination_id, insurance_expiry, permit_expiry, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           client_id = VALUES(client_id),
-           type = VALUES(type),
-           reg_no = VALUES(reg_no),
-           make = VALUES(make),
-           model = VALUES(model),
-           year = VALUES(year),
-           km = VALUES(km),
-           principal = VALUES(principal),
-           overdue = VALUES(overdue),
-           penalty = VALUES(penalty),
-           foreclosure = VALUES(foreclosure),
-           loan_id = VALUES(loan_id),
-           loan_account = VALUES(loan_account),
-           financier = VALUES(financier),
-           loan_amount = VALUES(loan_amount),
-           emi_amount = VALUES(emi_amount),
-           interest_rate = VALUES(interest_rate),
-           tenure = VALUES(tenure),
-           paid_emi = VALUES(paid_emi),
-           emi_start = VALUES(emi_start),
-           emi_end = VALUES(emi_end),
-           emi_schedule_json = VALUES(emi_schedule_json),
-           emi_history_json = VALUES(emi_history_json),
-           insurance_company = VALUES(insurance_company),
-           insurance_policy_no = VALUES(insurance_policy_no),
-           insurance_start = VALUES(insurance_start),
-           insurance_history_json = VALUES(insurance_history_json),
-           permit_no = VALUES(permit_no),
-           permit_issue = VALUES(permit_issue),
-           permit_type = VALUES(permit_type),
-           national_permit_expiry = VALUES(national_permit_expiry),
-           puc_no = VALUES(puc_no),
-           puc_expiry = VALUES(puc_expiry),
-           fitness_expiry = VALUES(fitness_expiry),
-           compliance_history_json = VALUES(compliance_history_json),
-           combination_id = VALUES(combination_id),
-           insurance_expiry = VALUES(insurance_expiry),
-           permit_expiry = VALUES(permit_expiry),
-           status = VALUES(status)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           vehicle.id,
           vehicle.client_id,
@@ -2209,18 +2157,9 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     }
     for (const due of safeDueTasks) {
       await conn.query(
-        `INSERT INTO due_tasks
+        `REPLACE INTO due_tasks
           (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           client_id = VALUES(client_id),
-           vehicle_id = VALUES(vehicle_id),
-           type = VALUES(type),
-           amount = VALUES(amount),
-           due_date = VALUES(due_date),
-           status = VALUES(status),
-           caller_id = VALUES(caller_id),
-           priority = VALUES(priority)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [due.id, due.client_id, due.vehicle_id, due.type, due.amount, due.due_date, due.status, due.caller_id, due.priority]
       );
     }
@@ -2242,34 +2181,17 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     }
     for (const item of clientImports) {
       await conn.query(
-        `INSERT INTO client_imports (id, client_id, file_name, imported_at, rows_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           client_id = VALUES(client_id),
-           file_name = VALUES(file_name),
-           imported_at = VALUES(imported_at),
-           rows_json = VALUES(rows_json)`,
+        `REPLACE INTO client_imports (id, client_id, file_name, imported_at, rows_json)
+         VALUES (?, ?, ?, ?, ?)`,
         [item.id, item.client_id, item.file_name, item.imported_at, JSON.stringify(item.rows)]
       );
     }
     if (documents) {
       for (const document of documents) {
         await conn.query(
-          `INSERT INTO documents
+          `REPLACE INTO documents
             (id, client_id, vehicle_id, task_id, type, file_name, mime_type, size_bytes, data_url, uploaded_by, uploaded_at, note)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE
-             client_id = VALUES(client_id),
-             vehicle_id = VALUES(vehicle_id),
-             task_id = VALUES(task_id),
-             type = VALUES(type),
-             file_name = VALUES(file_name),
-             mime_type = VALUES(mime_type),
-             size_bytes = VALUES(size_bytes),
-             data_url = VALUES(data_url),
-             uploaded_by = VALUES(uploaded_by),
-             uploaded_at = VALUES(uploaded_at),
-             note = VALUES(note)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             document.id,
             document.client_id,

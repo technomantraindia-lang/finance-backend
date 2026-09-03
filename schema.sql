@@ -206,3 +206,19 @@ CREATE TABLE IF NOT EXISTS documents (
   INDEX idx_documents_vehicle (vehicle_id),
   INDEX idx_documents_task (task_id)
 );
+
+CREATE TABLE IF NOT EXISTS whatsapp_messages (
+  id VARCHAR(64) PRIMARY KEY,
+  task_id VARCHAR(48) NOT NULL,
+  client_id VARCHAR(32) NOT NULL,
+  caller_id VARCHAR(32),
+  template_id VARCHAR(64),
+  phone VARCHAR(32),
+  body TEXT,
+  status VARCHAR(24) DEFAULT 'Prepared',
+  created_at VARCHAR(64),
+  updated_at VARCHAR(64),
+  INDEX idx_whatsapp_messages_task (task_id),
+  INDEX idx_whatsapp_messages_client (client_id),
+  INDEX idx_whatsapp_messages_status (status)
+);

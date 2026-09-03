@@ -35,6 +35,29 @@ let documentsReady = false;
 let documentsPromise = null;
 let marketplaceThreadsReady = false;
 let marketplaceThreadsPromise = null;
+let whatsappMessagesReady = false;
+let whatsappMessagesPromise = null;
+const defaultWhatsAppTemplates = [
+  {
+    id: "payment-reminder",
+    name: "Payment reminder",
+    body: "Hello {{customer}}, Kuber Finance reminder: {{vehicle}} has {{type}} due on {{dueDate}}. Amount {{amount}}. Please upload payment/renewal proof.",
+    active: true
+  },
+  {
+    id: "document-follow-up",
+    name: "Document follow-up",
+    body: "Hello {{customer}}, please share the pending {{type}} proof for {{vehicle}} so we can update your account.",
+    active: true
+  },
+  {
+    id: "promise-follow-up",
+    name: "Promise follow-up",
+    body: "Hello {{customer}}, following up on your {{type}} payment for {{vehicle}}. Please reply with an update.",
+    active: true
+  }
+];
+let whatsappTemplatesStore = null;
 const defaultReminderSettings = {
   enabled: DUE_MONITOR_ENABLED,
   intervalHours: DUE_MONITOR_INTERVAL_HOURS,
@@ -112,6 +135,7 @@ const memoryImportRows = [];
 const memoryClientImports = [];
 const memoryDocuments = [];
 const memoryMarketplaceThreads = [];
+const memoryWhatsAppLogs = [];
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -453,6 +477,48 @@ function normalizeMarketplaceThread(row) {
     reported: Boolean(row.reported),
     blocked: Boolean(row.blocked),
     updated_at: row.updatedAt || row.updated_at || now
+  };
+}
+
+function normalizeWhatsAppTemplate(row) {
+  return {
+    id: String(row.id || `wa-template-${Date.now()}`).trim(),
+    name: String(row.name || "Untitled template").trim().slice(0, 120),
+    body: String(row.body || "").trim().slice(0, 4000),
+    active: row.active !== false
+  };
+}
+
+function normalizeWhatsAppMessage(row) {
+  const now = new Date().toISOString();
+  const allowedStatuses = new Set(["Prepared", "Opened", "Sent", "Delivered", "Failed"]);
+  const status = allowedStatuses.has(String(row.status)) ? String(row.status) : "Prepared";
+  return {
+    id: String(row.id || `wa-${Date.now()}`),
+    task_id: String(row.taskId || row.task_id || "").trim(),
+    client_id: String(row.clientId || row.client_id || "").trim(),
+    caller_id: String(row.callerId || row.caller_id || "").trim(),
+    template_id: String(row.templateId || row.template_id || "").trim(),
+    phone: String(row.phone || "").trim().slice(0, 32),
+    body: String(row.body || "").trim().slice(0, 4000),
+    status,
+    created_at: row.createdAt || row.created_at || now,
+    updated_at: row.updatedAt || row.updated_at || now
+  };
+}
+
+function serializeWhatsAppMessage(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    clientId: row.client_id,
+    callerId: row.caller_id || "",
+    templateId: row.template_id || "",
+    phone: row.phone || "",
+    body: row.body || "",
+    status: row.status || "Prepared",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 
@@ -1098,6 +1164,7 @@ async function ensureCoreTables() {
   await ensureClientImportsTable();
   await ensureDocumentsTable();
   await ensureMarketplaceThreadsTable();
+  await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
   await ensureAdminUser();
 }
@@ -1290,6 +1357,38 @@ async function ensureMarketplaceThreadsTable(conn = null) {
     )`
   );
   marketplaceThreadsReady = true;
+}
+
+async function ensureWhatsAppMessagesTable(conn = null) {
+  if (!dbAvailable) return;
+  if (whatsappMessagesReady) return;
+  if (!conn && whatsappMessagesPromise) return whatsappMessagesPromise;
+  if (!conn) {
+    whatsappMessagesPromise = ensureWhatsAppMessagesTable(pool)
+      .finally(() => {
+        whatsappMessagesPromise = null;
+      });
+    return whatsappMessagesPromise;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS whatsapp_messages (
+      id VARCHAR(64) PRIMARY KEY,
+      task_id VARCHAR(48) NOT NULL,
+      client_id VARCHAR(32) NOT NULL,
+      caller_id VARCHAR(32),
+      template_id VARCHAR(64),
+      phone VARCHAR(32),
+      body TEXT,
+      status VARCHAR(24) DEFAULT 'Prepared',
+      created_at VARCHAR(64),
+      updated_at VARCHAR(64),
+      INDEX idx_whatsapp_messages_task (task_id),
+      INDEX idx_whatsapp_messages_client (client_id),
+      INDEX idx_whatsapp_messages_status (status)
+    )`
+  );
+  whatsappMessagesReady = true;
 }
 
 async function ensureClientsEmailColumn(conn = null) {
@@ -1994,6 +2093,95 @@ app.delete("/api/documents/:id", asyncHandler(async (req, res) => {
   res.json({ ok: true, deleted: id });
 }));
 
+async function getWhatsAppTemplates() {
+  if (whatsappTemplatesStore) return whatsappTemplatesStore;
+  if (dbAvailable) {
+    try {
+      const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'whatsapp_templates' LIMIT 1");
+      if (rows.length && rows[0].setting_value) {
+        const parsed = JSON.parse(rows[0].setting_value);
+        if (Array.isArray(parsed) && parsed.length) {
+          whatsappTemplatesStore = parsed.map(normalizeWhatsAppTemplate).filter((item) => item.body);
+          if (whatsappTemplatesStore.length) return whatsappTemplatesStore;
+        }
+      }
+    } catch { /* use defaults when settings are not available */ }
+  }
+  whatsappTemplatesStore = defaultWhatsAppTemplates.map(normalizeWhatsAppTemplate);
+  return whatsappTemplatesStore;
+}
+
+app.get("/api/whatsapp-templates", asyncHandler(async (req, res) => {
+  await pingDb();
+  res.json(await getWhatsAppTemplates());
+}));
+
+app.put("/api/whatsapp-templates", asyncHandler(async (req, res) => {
+  const incoming = Array.isArray(req.body?.templates) ? req.body.templates : [];
+  const templates = incoming
+    .map(normalizeWhatsAppTemplate)
+    .filter((item, index, list) => item.id && item.name && item.body && list.findIndex((candidate) => candidate.id === item.id) === index);
+  if (!templates.length) return res.status(400).json({ error: "At least one WhatsApp template is required." });
+  whatsappTemplatesStore = templates;
+  await pingDb();
+  if (dbAvailable) {
+    await pool.query(
+      "REPLACE INTO settings (setting_key, setting_value) VALUES ('whatsapp_templates', ?)",
+      [JSON.stringify(templates)]
+    );
+  }
+  res.json({ ok: true, templates });
+}));
+
+app.get("/api/whatsapp-logs", asyncHandler(async (req, res) => {
+  await pingDb();
+  if (!dbAvailable) return res.json(memoryWhatsAppLogs.map(serializeWhatsAppMessage));
+  await ensureWhatsAppMessagesTable();
+  const [rows] = await pool.query("SELECT * FROM whatsapp_messages ORDER BY updated_at DESC, created_at DESC");
+  res.json(rows.map(serializeWhatsAppMessage));
+}));
+
+app.post("/api/whatsapp-logs", asyncHandler(async (req, res) => {
+  const message = normalizeWhatsAppMessage(req.body || {});
+  if (!message.task_id || !message.client_id || !message.body) {
+    return res.status(400).json({ error: "taskId, clientId and body are required." });
+  }
+  await pingDb();
+  if (!dbAvailable) {
+    upsertMemoryItem(memoryWhatsAppLogs, message);
+    return res.status(201).json(serializeWhatsAppMessage(message));
+  }
+  await ensureWhatsAppMessagesTable();
+  await pool.query(
+    `REPLACE INTO whatsapp_messages
+      (id, task_id, client_id, caller_id, template_id, phone, body, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [message.id, message.task_id, message.client_id, message.caller_id, message.template_id, message.phone, message.body, message.status, message.created_at, message.updated_at]
+  );
+  res.status(201).json(serializeWhatsAppMessage(message));
+}));
+
+app.patch("/api/whatsapp-logs/:id", asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const status = String(req.body?.status || "").trim();
+  const allowedStatuses = new Set(["Prepared", "Opened", "Sent", "Delivered", "Failed"]);
+  if (!id || !allowedStatuses.has(status)) return res.status(400).json({ error: "A valid WhatsApp status is required." });
+  const updatedAt = new Date().toISOString();
+  await pingDb();
+  if (!dbAvailable) {
+    const message = memoryWhatsAppLogs.find((item) => item.id === id);
+    if (!message) return res.status(404).json({ error: "WhatsApp message not found." });
+    message.status = status;
+    message.updated_at = updatedAt;
+    return res.json(serializeWhatsAppMessage(message));
+  }
+  await ensureWhatsAppMessagesTable();
+  const [result] = await pool.query("UPDATE whatsapp_messages SET status = ?, updated_at = ? WHERE id = ?", [status, updatedAt, id]);
+  if (!result.affectedRows) return res.status(404).json({ error: "WhatsApp message not found." });
+  const [rows] = await pool.query("SELECT * FROM whatsapp_messages WHERE id = ?", [id]);
+  res.json(serializeWhatsAppMessage(rows[0]));
+}));
+
 app.get("/api/marketplace-threads", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
@@ -2110,7 +2298,12 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
       await conn.query(
         `REPLACE INTO vehicles
           (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, combination_id, insurance_expiry, permit_expiry, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         )`,
         [
           vehicle.id,
           vehicle.client_id,

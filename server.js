@@ -1862,12 +1862,12 @@ app.post("/api/login", asyncHandler(async (req, res) => {
           OR LOWER(TRIM(email)) = ?
           OR LOWER(TRIM(name)) = LOWER(TRIM(?))
        ORDER BY CASE
-         WHEN id = ? THEN 0
-         WHEN LOWER(TRIM(email)) = ? THEN 1
+         WHEN LOWER(TRIM(email)) = ? THEN 0
+         WHEN id = ? THEN 1
          ELSE 2
        END, created_at DESC
        LIMIT 1`,
-      [expectedClientId, lowerEmail, user.name, expectedClientId, lowerEmail]
+      [expectedClientId, lowerEmail, user.name, lowerEmail, expectedClientId]
     );
     clientId = clientRows[0]?.id || null;
   }

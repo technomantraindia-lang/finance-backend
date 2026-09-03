@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS vehicles (
   puc_expiry DATE,
   fitness_expiry DATE,
   compliance_history_json LONGTEXT,
+  combination_id VARCHAR(80),
   insurance_expiry DATE,
   permit_expiry DATE,
   status VARCHAR(32) DEFAULT 'Active',

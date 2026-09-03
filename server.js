@@ -309,6 +309,7 @@ function normalizeVehicle(row) {
     puc_expiry: toMysqlDate(row.pucExpiry || row.puc_expiry),
     fitness_expiry: toMysqlDate(row.fitnessExpiry || row.fitness_expiry),
     compliance_history_json: JSON.stringify(parseJsonArray(row.complianceHistory || row.compliance_history_json)),
+    combination_id: String(row.combinationId || row.combination_id || "").trim(),
     insurance_expiry: toMysqlDate(row.insuranceExpiry || row.insurance_expiry),
     permit_expiry: toMysqlDate(row.permitExpiry || row.permit_expiry),
     status: row.status || "Active"
@@ -1029,7 +1030,8 @@ async function ensureVehicleFinanceColumns(conn = null) {
     ["puc_no", "VARCHAR(100) NULL"],
     ["puc_expiry", "DATE NULL"],
     ["fitness_expiry", "DATE NULL"],
-    ["compliance_history_json", "LONGTEXT NULL"]
+    ["compliance_history_json", "LONGTEXT NULL"],
+    ["combination_id", "VARCHAR(80) NULL"]
   ];
   for (const [name, definition] of columns) {
     try {
@@ -1997,8 +1999,8 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     for (const vehicle of vehicles) {
       await conn.query(
         `INSERT INTO vehicles
-          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, insurance_expiry, permit_expiry, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, combination_id, insurance_expiry, permit_expiry, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            client_id = VALUES(client_id),
            type = VALUES(type),
@@ -2035,6 +2037,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
            puc_expiry = VALUES(puc_expiry),
            fitness_expiry = VALUES(fitness_expiry),
            compliance_history_json = VALUES(compliance_history_json),
+           combination_id = VALUES(combination_id),
            insurance_expiry = VALUES(insurance_expiry),
            permit_expiry = VALUES(permit_expiry),
            status = VALUES(status)`,
@@ -2075,6 +2078,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
           vehicle.puc_expiry,
           vehicle.fitness_expiry,
           vehicle.compliance_history_json,
+          vehicle.combination_id,
           vehicle.insurance_expiry,
           vehicle.permit_expiry,
           vehicle.status

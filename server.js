@@ -33,6 +33,8 @@ let clientImportsReady = false;
 let clientImportsPromise = null;
 let documentsReady = false;
 let documentsPromise = null;
+let verificationItemsReady = false;
+let verificationItemsPromise = null;
 let marketplaceThreadsReady = false;
 let marketplaceThreadsPromise = null;
 let whatsappMessagesReady = false;
@@ -87,6 +89,8 @@ let lastCallerAssignmentResult = {
   callers: 0,
   error: ""
 };
+const authSessions = new Map();
+const SESSION_TTL_MS = Math.max(15 * 60 * 1000, Number(process.env.SESSION_TTL_HOURS || 24) * 60 * 60 * 1000);
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -134,6 +138,7 @@ const memoryAuditLogs = [];
 const memoryImportRows = [];
 const memoryClientImports = [];
 const memoryDocuments = [];
+const memoryVerificationItems = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
 const defaultRolePermissions = [
@@ -437,6 +442,39 @@ function normalizeDocument(row) {
     uploaded_by: row.uploadedBy || row.uploaded_by || "",
     uploaded_at: row.uploadedAt || row.uploaded_at || new Date().toLocaleString("en-IN"),
     note: row.note || ""
+  };
+}
+
+function normalizeVerificationItem(row) {
+  const parsePairs = (value) => {
+    if (Array.isArray(value)) return value.filter((pair) => Array.isArray(pair) && pair.length >= 2).map((pair) => [String(pair[0]), String(pair[1])]);
+    if (typeof value !== "string" || !value.trim()) return [];
+    try {
+      return parsePairs(JSON.parse(value));
+    } catch (error) {
+      return [];
+    }
+  };
+  return {
+    id: String(row.id || `vf-${Date.now()}`),
+    task_id: String(row.taskId || row.task_id || ""),
+    submitted_by: String(row.submittedBy || row.submitted_by || ""),
+    submitted_at: row.submittedAt || row.submitted_at || new Date().toLocaleString("en-IN"),
+    proof_type: String(row.proofType || row.proof_type || "Proof"),
+    details: parsePairs(row.details),
+    audit: parsePairs(row.audit)
+  };
+}
+
+function serializeVerificationItem(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    submittedBy: row.submitted_by,
+    submittedAt: row.submitted_at,
+    proofType: row.proof_type,
+    details: Array.isArray(row.details) ? row.details : [],
+    audit: Array.isArray(row.audit) ? row.audit : []
   };
 }
 
@@ -1163,6 +1201,7 @@ async function ensureCoreTables() {
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
   await ensureDocumentsTable();
+  await ensureVerificationItemsTable();
   await ensureMarketplaceThreadsTable();
   await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
@@ -1326,6 +1365,35 @@ async function ensureDocumentsTable(conn = null) {
   documentsReady = true;
 }
 
+async function ensureVerificationItemsTable(conn = null) {
+  if (!dbAvailable) return;
+  if (verificationItemsReady) return;
+  if (!conn && verificationItemsPromise) return verificationItemsPromise;
+  if (!conn) {
+    verificationItemsPromise = ensureVerificationItemsTable(pool)
+      .finally(() => {
+        verificationItemsPromise = null;
+      });
+    return verificationItemsPromise;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS verification_items (
+      id VARCHAR(64) PRIMARY KEY,
+      task_id VARCHAR(48) NOT NULL,
+      submitted_by VARCHAR(120),
+      submitted_at VARCHAR(64),
+      proof_type VARCHAR(64),
+      details_json JSON,
+      audit_json JSON,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_verification_items_task (task_id),
+      FOREIGN KEY (task_id) REFERENCES due_tasks(id) ON DELETE CASCADE
+    )`
+  );
+  verificationItemsReady = true;
+}
+
 async function ensureMarketplaceThreadsTable(conn = null) {
   if (!dbAvailable) return;
   if (marketplaceThreadsReady) return;
@@ -1417,8 +1485,255 @@ async function ensureClientsEmailColumn(conn = null) {
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
+function issueSession(user, clientId = null) {
+  const token = crypto.randomBytes(32).toString("hex");
+  authSessions.set(token, {
+    userId: user.id,
+    name: user.name,
+    role: user.role,
+    email: user.email,
+    clientId,
+    expiresAt: Date.now() + SESSION_TTL_MS
+  });
+  return token;
+}
+
+function readBearerToken(req) {
+  const header = String(req.headers.authorization || "");
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+}
+
+function authenticateRequest(req, res, next) {
+  const token = readBearerToken(req);
+  const session = token ? authSessions.get(token) : null;
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) authSessions.delete(token);
+    return res.status(401).json({ error: "Authentication required. Please log in again." });
+  }
+  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  req.auth = { ...session, token };
+  next();
+}
+
+function isAdminRequest(req) {
+  return req.auth?.role === "Admin";
+}
+
+function isCustomerRequest(req) {
+  return ["Owner", "Customer"].includes(req.auth?.role);
+}
+
+function denyUnlessAdmin(req, res) {
+  if (isAdminRequest(req)) return false;
+  res.status(403).json({ error: "Admin permission required." });
+  return true;
+}
+
+function safeVehicleForRole(row, req) {
+  if (isAdminRequest(req)) return row;
+  const safe = { ...row };
+  delete safe.loan_account;
+  delete safe.loanAccount;
+  return safe;
+}
+
+function memoryClientIdsForRequest(req) {
+  if (isAdminRequest(req)) return null;
+  if (isCustomerRequest(req)) return req.auth.clientId ? new Set([req.auth.clientId]) : new Set();
+  return new Set(memoryClients
+    .filter((client) => client.caller_id === req.auth.userId || memoryDues.some((task) => task.client_id === client.id && task.caller_id === req.auth.userId))
+    .map((client) => client.id));
+}
+
+async function mysqlClientIdsForRequest(req) {
+  if (isAdminRequest(req)) return null;
+  if (isCustomerRequest(req)) return req.auth.clientId ? [req.auth.clientId] : [];
+  const [rows] = await pool.query(
+    `SELECT id FROM clients
+     WHERE caller_id = ?
+        OR EXISTS (SELECT 1 FROM due_tasks d WHERE d.client_id = clients.id AND d.caller_id = ?)`,
+    [req.auth.userId, req.auth.userId]
+  );
+  return rows.map((row) => row.id);
+}
+
+function sqlScope(ids, column) {
+  if (!ids.length) return { clause: "1 = 0", params: [] };
+  return { clause: `${column} IN (${ids.map(() => "?").join(",")})`, params: ids };
+}
+
+async function canAccessClientId(req, clientId) {
+  if (isAdminRequest(req)) return true;
+  if (isCustomerRequest(req)) return Boolean(clientId && req.auth.clientId === clientId);
+  if (!dbAvailable) return memoryClientIdsForRequest(req).has(clientId);
+  const [rows] = await pool.query(
+    `SELECT id FROM clients
+     WHERE id = ? AND (caller_id = ? OR EXISTS (SELECT 1 FROM due_tasks d WHERE d.client_id = clients.id AND d.caller_id = ?))
+     LIMIT 1`,
+    [clientId, req.auth.userId, req.auth.userId]
+  );
+  return rows.length > 0;
+}
+
+async function syncScopedData(req, payload) {
+  await pingDb();
+  if (isCustomerRequest(req)) {
+    const allowed = new Set([req.auth.clientId].filter(Boolean));
+    const ownDocuments = (payload.documents || []).filter((item) => allowed.has(item.client_id));
+    const ownThreads = (payload.marketplaceThreads || []).filter((item) => allowed.has(item.buyer_client_id) || allowed.has(item.seller_client_id));
+    const ownVerificationItems = payload.verificationItems || [];
+    if (!dbAvailable) {
+      const ownVehicleIds = new Set(memoryVehicles.filter((vehicle) => allowed.has(vehicle.client_id)).map((vehicle) => vehicle.id));
+      const ownTaskIds = new Set(memoryDues.filter((task) => allowed.has(task.client_id)).map((task) => task.id));
+      for (const task of payload.dueTasks || []) {
+        const current = memoryDues.find((item) => item.id === task.id && ownTaskIds.has(item.id));
+        if (current && task.status === "Proof Pending") current.status = "Proof Pending";
+      }
+      const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
+      for (const listing of ownListings) {
+        const current = memoryListings.find((item) => item.id === listing.id);
+        const protectedStatus = ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
+        upsertMemoryItem(memoryListings, { ...listing, status: protectedStatus });
+      }
+      const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
+      for (let index = memoryVerificationItems.length - 1; index >= 0; index -= 1) {
+        if (ownTaskIds.has(memoryVerificationItems[index].task_id)) memoryVerificationItems.splice(index, 1);
+      }
+      memoryVerificationItems.push(...verifiedItems);
+      for (let index = memoryDocuments.length - 1; index >= 0; index -= 1) {
+        if (allowed.has(memoryDocuments[index].client_id)) memoryDocuments.splice(index, 1);
+      }
+      memoryDocuments.push(...ownDocuments);
+      for (let index = memoryMarketplaceThreads.length - 1; index >= 0; index -= 1) {
+        const item = memoryMarketplaceThreads[index];
+        if (allowed.has(item.buyer_client_id) || allowed.has(item.seller_client_id)) memoryMarketplaceThreads.splice(index, 1);
+      }
+      memoryMarketplaceThreads.push(...ownThreads);
+      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: ownDocuments.length, verificationItems: verifiedItems.length, marketplaceThreads: ownThreads.length };
+    }
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await ensureDocumentsTable(conn);
+      await ensureVerificationItemsTable(conn);
+      await ensureMarketplaceThreadsTable(conn);
+      const clientScope = sqlScope([...allowed], "client_id");
+      const [vehicleRows] = await conn.query(`SELECT id FROM vehicles WHERE ${clientScope.clause}`, clientScope.params);
+      const ownVehicleIds = new Set(vehicleRows.map((row) => row.id));
+      const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
+      for (const task of payload.dueTasks || []) {
+        if (task.status === "Proof Pending") {
+          await conn.query("UPDATE due_tasks SET status = 'Proof Pending' WHERE id = ? AND client_id = ?", [task.id, req.auth.clientId]);
+        }
+      }
+      for (const listing of ownListings) {
+        await conn.query(
+          `INSERT INTO listings
+            (id, vehicle_id, title, price, location, status, condition_note, photos_json)
+           VALUES (?, ?, ?, ?, ?, 'Submitted', ?, ?)
+           ON DUPLICATE KEY UPDATE
+             vehicle_id = VALUES(vehicle_id),
+             title = VALUES(title),
+             price = VALUES(price),
+             location = VALUES(location),
+             condition_note = VALUES(condition_note),
+             photos_json = VALUES(photos_json),
+             status = CASE WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END`,
+          [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.condition_note, JSON.stringify(listing.photos)]
+        );
+      }
+      const [taskRows] = await conn.query("SELECT id FROM due_tasks WHERE client_id = ?", [req.auth.clientId]);
+      const ownTaskIds = new Set(taskRows.map((row) => row.id));
+      const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
+      for (const item of verifiedItems) {
+        await conn.query(
+          `REPLACE INTO verification_items
+            (id, task_id, submitted_by, submitted_at, proof_type, details_json, audit_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [item.id, item.task_id, item.submitted_by, item.submitted_at, item.proof_type, JSON.stringify(item.details), JSON.stringify(item.audit)]
+        );
+      }
+      const verificationTaskIds = verifiedItems.map((item) => item.task_id);
+      await conn.query(`DELETE v FROM verification_items v JOIN due_tasks d ON d.id = v.task_id WHERE d.client_id = ?${verificationTaskIds.length ? ` AND v.task_id NOT IN (${verificationTaskIds.map(() => "?").join(",")})` : ""}`, [req.auth.clientId, ...verificationTaskIds]);
+      for (const document of ownDocuments) {
+        await conn.query(
+          `REPLACE INTO documents
+            (id, client_id, vehicle_id, task_id, type, file_name, mime_type, size_bytes, data_url, uploaded_by, uploaded_at, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [document.id, document.client_id, document.vehicle_id, document.task_id, document.type, document.file_name, document.mime_type, document.size_bytes, document.data_url, document.uploaded_by, document.uploaded_at, document.note]
+        );
+      }
+      const documentIds = ownDocuments.map((item) => item.id);
+      await conn.query(`DELETE FROM documents WHERE ${clientScope.clause}${documentIds.length ? ` AND id NOT IN (${documentIds.map(() => "?").join(",")})` : ""}`, [...clientScope.params, ...documentIds]);
+      for (const thread of ownThreads) {
+        await conn.query(
+          `INSERT INTO marketplace_threads
+            (id, listing_id, buyer_client_id, seller_client_id, status, messages_json, reported, blocked, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE status = VALUES(status), messages_json = VALUES(messages_json), reported = VALUES(reported), blocked = VALUES(blocked), updated_at = VALUES(updated_at)`,
+          [thread.id, thread.listing_id, thread.buyer_client_id, thread.seller_client_id, thread.status, JSON.stringify(thread.messages), thread.reported ? 1 : 0, thread.blocked ? 1 : 0, thread.updated_at]
+        );
+      }
+      const threadIds = ownThreads.map((item) => item.id);
+      const buyerScope = sqlScope([...allowed], "buyer_client_id");
+      const sellerScope = sqlScope([...allowed], "seller_client_id");
+      await conn.query(`DELETE FROM marketplace_threads WHERE (${buyerScope.clause} OR ${sellerScope.clause})${threadIds.length ? ` AND id NOT IN (${threadIds.map(() => "?").join(",")})` : ""}`, [...buyerScope.params, ...sellerScope.params, ...threadIds]);
+      await conn.commit();
+      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: documentIds.length, verificationItems: verifiedItems.length, marketplaceThreads: threadIds.length };
+    } catch (error) {
+      await conn.rollback();
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  const ownActivities = (payload.callerActivities || []).filter((item) => item.caller_id === req.auth.userId);
+  if (!dbAvailable) {
+    const assignedTaskIds = new Set(memoryDues.filter((task) => task.caller_id === req.auth.userId).map((task) => task.id));
+    for (const task of payload.dueTasks || []) {
+      const current = memoryDues.find((item) => item.id === task.id && assignedTaskIds.has(item.id));
+      if (current) {
+        current.status = task.status;
+        current.priority = task.priority;
+      }
+    }
+    for (const activity of ownActivities) {
+      if (assignedTaskIds.has(activity.task_id)) upsertMemoryItem(memoryCallerActivities, activity);
+    }
+    return { callerActivities: ownActivities.length };
+  }
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const task of payload.dueTasks || []) {
+      await conn.query("UPDATE due_tasks SET status = ?, priority = ? WHERE id = ? AND caller_id = ?", [task.status, task.priority, task.id, req.auth.userId]);
+    }
+    for (const activity of ownActivities) {
+      await conn.query(
+        `INSERT INTO caller_activities
+          (id, task_id, caller_id, outcome, notes, expected_amount, next_follow_up, channel, occurred_at)
+         SELECT ?, d.id, ?, ?, ?, ?, ?, ?, ? FROM due_tasks d WHERE d.id = ? AND d.caller_id = ?
+         ON DUPLICATE KEY UPDATE outcome = VALUES(outcome), notes = VALUES(notes), expected_amount = VALUES(expected_amount), next_follow_up = VALUES(next_follow_up), channel = VALUES(channel), occurred_at = VALUES(occurred_at)`,
+        [activity.id, req.auth.userId, activity.outcome, activity.notes, activity.expected_amount, activity.next_follow_up, activity.channel, activity.occurred_at, activity.task_id, req.auth.userId]
+      );
+    }
+    await conn.commit();
+    return { callerActivities: ownActivities.length };
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
 app.use("/api", asyncHandler(async (req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path === "/health" || req.path === "/login") return next();
+  authenticateRequest(req, res, next);
+}));
+
+app.use("/api", asyncHandler(async (req, res, next) => {
   await pingDb();
   if (REQUIRE_DATABASE && !dbAvailable) {
     return res.status(503).json({
@@ -1463,6 +1778,7 @@ app.get("/api/health", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const reminderSettings = currentReminderSettings();
   res.json({
     ...reminderSettings,
@@ -1472,11 +1788,13 @@ app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {
 }));
 
 app.post("/api/due-monitor/run", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const result = await runDueDateMonitoring("manual");
   res.json(result);
 }));
 
 app.get("/api/caller-assignment/status", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   res.json({
     defaultMode: CALLER_ASSIGNMENT_MODE,
     modes: ["permanent-client", "round-robin", "location-wise", "category-wise"],
@@ -1485,12 +1803,14 @@ app.get("/api/caller-assignment/status", asyncHandler(async (req, res) => {
 }));
 
 app.post("/api/caller-assignment/run", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const mode = normalizeAssignmentMode(req.body?.mode || CALLER_ASSIGNMENT_MODE);
   const result = await runCallerAssignment("manual", mode);
   res.json(result);
 }));
 
 app.post("/api/caller-assignment/tasks/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const taskId = String(req.params.id || "").trim();
   const callerId = String(req.body?.callerId ?? "").trim();
   if (!taskId) return res.status(400).json({ error: "task id is required." });
@@ -1583,22 +1903,26 @@ let commonCustomerPassword = process.env.COMMON_CUSTOMER_PASSWORD || "Kuber@123"
 
 // ─── Common customer password (admin sets this) ───────────
 app.get("/api/common-password", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   await getCommonPassword();
   res.json({ configured: Boolean(commonPasswordStore), value: commonPasswordStore || "" });
 }));
 
 app.get("/api/settings", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const value = await getCommonPassword();
   const rolePermissions = await getRolePermissions();
   res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings() });
 }));
 
 app.get("/api/reminder-settings", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   await pingDb();
   res.json(currentReminderSettings());
 }));
 
 app.put("/api/reminder-settings", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const nextSettings = sanitizeReminderSettings(req.body || {});
   reminderSettingsStore = nextSettings;
   if (dbAvailable) {
@@ -1614,6 +1938,7 @@ app.put("/api/reminder-settings", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/common-password-value", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const value = await getCommonPassword();
   res.json({ value });
 }));
@@ -1633,6 +1958,7 @@ async function getCommonPassword() {
 }
 
 app.put("/api/common-password", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const { password } = req.body;
   if (!password || String(password).trim().length < 1) {
     return res.status(400).json({ error: "Password required." });
@@ -1668,11 +1994,13 @@ async function getRolePermissions() {
 }
 
 app.get("/api/permissions", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const rolePermissions = await getRolePermissions();
   res.json({ rolePermissions });
 }));
 
 app.put("/api/permissions", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const incoming = Array.isArray(req.body?.rolePermissions) ? req.body.rolePermissions : [];
   const allowedValues = new Set(["Yes", "No", "Assigned only", "Own fleet", "Optional", "Reports only"]);
   const sanitized = incoming
@@ -1702,13 +2030,14 @@ app.put("/api/permissions", asyncHandler(async (req, res) => {
 app.get("/api/users", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryUsers);
+    return res.json(isAdminRequest(req) ? memoryUsers : memoryUsers.filter((user) => user.id === req.auth.userId));
   }
-  const [rows] = await pool.query("SELECT * FROM users");
+  const [rows] = await pool.query(isAdminRequest(req) ? "SELECT * FROM users" : "SELECT * FROM users WHERE id = ?", isAdminRequest(req) ? [] : [req.auth.userId]);
   res.json(rows);
 }));
 
 app.post("/api/users", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const { name, email, password: clientPassword } = req.body;
   const requestedRole = String(req.body?.role || "Customer");
   const userRole = ["Customer", "Owner", "Caller"].includes(requestedRole) ? requestedRole : "Customer";
@@ -1760,12 +2089,14 @@ app.post("/api/users", asyncHandler(async (req, res) => {
 
 // Delete a customer account + client
 app.delete("/api/users/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const { id } = req.params;
   await pingDb();
   if (!dbAvailable) {
     const index = memoryUsers.findIndex((u) => u.id === id);
     if (index === -1) return res.status(404).json({ error: "User not found" });
     const user = memoryUsers[index];
+    if (user.role !== "Caller" && user.role !== "Customer") return res.status(400).json({ error: "Only caller or customer accounts can be deleted here." });
     memoryUsers.splice(index, 1);
     const clientId = `c-${user.id.slice(2)}`;
     const clientIndex = memoryClients.findIndex((c) => c.id === clientId);
@@ -1777,13 +2108,34 @@ app.delete("/api/users/:id", asyncHandler(async (req, res) => {
     for (let i = memoryDues.length - 1; i >= 0; i -= 1) {
       if (memoryDues[i].client_id === clientId) memoryDues.splice(i, 1);
     }
+    for (const task of memoryDues) {
+      if (task.caller_id === id) task.caller_id = null;
+    }
+    for (const clientRecord of memoryClients) {
+      if (clientRecord.caller_id === id) clientRecord.caller_id = null;
+    }
     for (let i = memoryListings.length - 1; i >= 0; i -= 1) {
       if (vehicleIds.has(memoryListings[i].vehicle_id)) memoryListings.splice(i, 1);
     }
     return res.json({ ok: true, id, mode: "memory" });
   }
-  await pool.query("DELETE FROM users WHERE id = ?", [id]);
-  await pool.query("DELETE FROM clients WHERE id = ?", [`c-${id.slice(2)}`]);
+  const [userRows] = await pool.query("SELECT id, role FROM users WHERE id = ?", [id]);
+  if (!userRows.length) return res.status(404).json({ error: "User not found" });
+  if (!["Caller", "Customer"].includes(userRows[0].role)) return res.status(400).json({ error: "Only caller or customer accounts can be deleted here." });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query("UPDATE due_tasks SET caller_id = NULL WHERE caller_id = ?", [id]);
+    await conn.query("UPDATE clients SET caller_id = NULL WHERE caller_id = ?", [id]);
+    await conn.query("DELETE FROM users WHERE id = ?", [id]);
+    if (userRows[0].role === "Customer") await conn.query("DELETE FROM clients WHERE id = ?", [`c-${id.slice(2)}`]);
+    await conn.commit();
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
   res.json({ ok: true, id, mode: "mysql" });
 }));
 
@@ -1808,6 +2160,7 @@ app.post("/api/login", asyncHandler(async (req, res) => {
           role: created.user.role,
           email: created.user.email,
           clientId: created.client.id,
+          token: issueSession(created.user, created.client.id),
           needsPasswordChange: true,
           mode: "memory"
         });
@@ -1827,6 +2180,7 @@ app.post("/api/login", asyncHandler(async (req, res) => {
       role: user.role,
       email: user.email,
       clientId: client ? client.id : null,
+      token: issueSession(user, client ? client.id : null),
       needsPasswordChange: usingCommon && user.role !== "Admin",
       mode: "memory"
     });
@@ -1877,6 +2231,7 @@ app.post("/api/login", asyncHandler(async (req, res) => {
     role: user.role,
     email: user.email,
     clientId,
+    token: issueSession(user, clientId),
     needsPasswordChange: usingCommon && user.role !== "Admin",
     mode: "mysql"
   });
@@ -1885,6 +2240,9 @@ app.post("/api/login", asyncHandler(async (req, res) => {
 // Change customer's own password
 app.post("/api/change-password", asyncHandler(async (req, res) => {
   const { id, newPassword } = req.body;
+  if (!req.auth || req.auth.userId !== String(id || "")) {
+    return res.status(403).json({ error: "You can only change your own password." });
+  }
   if (!id || !newPassword || String(newPassword).length < 4) {
     return res.status(400).json({ error: "New password must be at least 4 characters." });
   }
@@ -1904,10 +2262,13 @@ app.post("/api/change-password", asyncHandler(async (req, res) => {
 app.get("/api/clients", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryClients);
+    const allowed = memoryClientIdsForRequest(req);
+    return res.json(allowed ? memoryClients.filter((client) => allowed.has(client.id)) : memoryClients);
   }
   await ensureClientsEmailColumn();
-  const [rows] = await pool.query("SELECT * FROM clients");
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "id") : null;
+  const [rows] = await pool.query(`SELECT * FROM clients${scope ? ` WHERE ${scope.clause}` : ""}`, scope?.params || []);
   res.json(rows);
 }));
 
@@ -1915,11 +2276,14 @@ app.get("/api/clients/:id", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
     const row = memoryClients.find((c) => c.id === req.params.id);
-    if (!row) return res.status(404).json({ error: "Client not found" });
+    const allowed = memoryClientIdsForRequest(req);
+    if (!row || (allowed && !allowed.has(row.id))) return res.status(404).json({ error: "Client not found" });
     return res.json(row);
   }
   await ensureClientsEmailColumn();
-  const [rows] = await pool.query("SELECT * FROM clients WHERE id = ?", [req.params.id]);
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "id") : null;
+  const [rows] = await pool.query(`SELECT * FROM clients WHERE id = ?${scope ? ` AND ${scope.clause}` : ""}`, [req.params.id, ...(scope?.params || [])]);
   if (!rows.length) return res.status(404).json({ error: "Client not found" });
   res.json(rows[0]);
 }));
@@ -1928,45 +2292,57 @@ app.get("/api/clients/:id", asyncHandler(async (req, res) => {
 app.get("/api/vehicles", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryVehicles);
+    const allowed = memoryClientIdsForRequest(req);
+    return res.json((allowed ? memoryVehicles.filter((vehicle) => allowed.has(vehicle.client_id)) : memoryVehicles).map((vehicle) => safeVehicleForRole(vehicle, req)));
   }
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(
     `SELECT v.*, c.name AS client_name
      FROM vehicles v
      LEFT JOIN clients c ON c.id = v.client_id`
+     + (scope ? ` WHERE ${scope.clause}` : ""),
+    scope?.params || []
   );
-  res.json(rows);
+  res.json(rows.map((row) => safeVehicleForRole(row, req)));
 }));
 
 app.get("/api/vehicles/:id", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
     const row = memoryVehicles.find((vehicle) => vehicle.id === req.params.id);
-    if (!row) return res.status(404).json({ error: "Vehicle not found" });
-    return res.json(row);
+    const allowed = memoryClientIdsForRequest(req);
+    if (!row || (allowed && !allowed.has(row.client_id))) return res.status(404).json({ error: "Vehicle not found" });
+    return res.json(safeVehicleForRole(row, req));
   }
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(
     `SELECT v.*, c.name AS client_name
      FROM vehicles v
      LEFT JOIN clients c ON c.id = v.client_id
-     WHERE v.id = ?`,
-    [req.params.id]
+     WHERE v.id = ?${scope ? ` AND ${scope.clause}` : ""}`,
+    [req.params.id, ...(scope?.params || [])]
   );
   if (!rows.length) return res.status(404).json({ error: "Vehicle not found" });
-  res.json(rows[0]);
+  res.json(safeVehicleForRole(rows[0], req));
 }));
 
 // ─── Due Tasks ───────────────────────────────────────────
 app.get("/api/dues", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryDues);
+    const allowed = memoryClientIdsForRequest(req);
+    return res.json(allowed ? memoryDues.filter((task) => allowed.has(task.client_id)) : memoryDues);
   }
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "d.client_id") : null;
   const [rows] = await pool.query(
     `SELECT d.*, c.name AS client_name, v.reg_no AS vehicle_reg_no
      FROM due_tasks d
      LEFT JOIN clients c ON c.id = d.client_id
-     LEFT JOIN vehicles v ON v.id = d.vehicle_id`
+     LEFT JOIN vehicles v ON v.id = d.vehicle_id` + (scope ? ` WHERE ${scope.clause}` : ""),
+    scope?.params || []
   );
   res.json(rows);
 }));
@@ -1975,9 +2351,21 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
 app.get("/api/listings", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryListings);
+    const allowed = memoryClientIdsForRequest(req);
+    if (req.auth.role === "Caller") return res.json([]);
+    return res.json((allowed ? memoryListings.filter((listing) => {
+      const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
+      return ["Active", "Reserved"].includes(listing.status) || (vehicle && allowed.has(vehicle.client_id));
+    }) : memoryListings));
   }
-  const [rows] = await pool.query("SELECT * FROM listings");
+  const allowed = await mysqlClientIdsForRequest(req);
+  if (req.auth.role === "Caller") return res.json([]);
+  const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
+  const [rows] = await pool.query(
+    `SELECT l.* FROM listings l JOIN vehicles v ON v.id = l.vehicle_id
+     ${scope ? `WHERE l.status IN ('Active', 'Reserved') OR ${scope.clause}` : ""}`,
+    scope?.params || []
+  );
   res.json(rows.map(normalizeListing));
 }));
 
@@ -1985,9 +2373,23 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
 app.get("/api/caller-activities", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryCallerActivities);
+    if (isAdminRequest(req)) return res.json(memoryCallerActivities);
+    if (isCustomerRequest(req)) {
+      const allowed = memoryClientIdsForRequest(req);
+      const taskIds = new Set(memoryDues.filter((task) => allowed.has(task.client_id)).map((task) => task.id));
+      return res.json(memoryCallerActivities.filter((activity) => taskIds.has(activity.task_id)));
+    }
+    return res.json(memoryCallerActivities.filter((activity) => activity.caller_id === req.auth.userId));
   }
-  const [rows] = await pool.query("SELECT * FROM caller_activities");
+  if (isCustomerRequest(req)) {
+    const allowed = await mysqlClientIdsForRequest(req);
+    const scope = sqlScope(allowed, "d.client_id");
+    const [rows] = await pool.query(`SELECT a.* FROM caller_activities a JOIN due_tasks d ON d.id = a.task_id WHERE ${scope.clause}`, scope.params);
+    return res.json(rows);
+  }
+  const [rows] = await pool.query(isAdminRequest(req)
+    ? "SELECT * FROM caller_activities"
+    : "SELECT * FROM caller_activities WHERE caller_id = ?", isAdminRequest(req) ? [] : [req.auth.userId]);
   res.json(rows);
 }));
 
@@ -1995,8 +2397,9 @@ app.get("/api/caller-activities", asyncHandler(async (req, res) => {
 app.get("/api/audit-logs", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryAuditLogs);
+    return res.json(isAdminRequest(req) ? memoryAuditLogs : []);
   }
+  if (!isAdminRequest(req)) return res.json([]);
   const [rows] = await pool.query("SELECT * FROM audit_logs");
   res.json(rows);
 }));
@@ -2005,8 +2408,9 @@ app.get("/api/audit-logs", asyncHandler(async (req, res) => {
 app.get("/api/imports", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryImportRows);
+    return res.json(isAdminRequest(req) ? memoryImportRows : []);
   }
+  if (!isAdminRequest(req)) return res.json([]);
   const [rows] = await pool.query("SELECT * FROM import_rows");
   res.json(rows);
 }));
@@ -2014,7 +2418,8 @@ app.get("/api/imports", asyncHandler(async (req, res) => {
 app.get("/api/client-imports", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryClientImports.map((item) => ({
+    const allowed = memoryClientIdsForRequest(req);
+    return res.json((allowed ? memoryClientImports.filter((item) => allowed.has(item.client_id)) : memoryClientImports).map((item) => ({
       id: item.id,
       clientId: item.client_id,
       fileName: item.file_name,
@@ -2023,7 +2428,9 @@ app.get("/api/client-imports", asyncHandler(async (req, res) => {
     })));
   }
   await ensureClientImportsTable();
-  const [rows] = await pool.query("SELECT * FROM client_imports ORDER BY created_at DESC");
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "client_id") : null;
+  const [rows] = await pool.query(`SELECT * FROM client_imports${scope ? ` WHERE ${scope.clause}` : ""} ORDER BY created_at DESC`, scope?.params || []);
   res.json(rows.map((item) => ({
     id: item.id,
     clientId: item.client_id,
@@ -2036,11 +2443,44 @@ app.get("/api/client-imports", asyncHandler(async (req, res) => {
 app.get("/api/documents", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryDocuments.map(serializeDocument));
+    const allowed = memoryClientIdsForRequest(req);
+    return res.json((allowed ? memoryDocuments.filter((document) => allowed.has(document.client_id)) : memoryDocuments).map(serializeDocument));
   }
   await ensureDocumentsTable();
-  const [rows] = await pool.query("SELECT * FROM documents ORDER BY created_at DESC");
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "client_id") : null;
+  const [rows] = await pool.query(`SELECT * FROM documents${scope ? ` WHERE ${scope.clause}` : ""} ORDER BY created_at DESC`, scope?.params || []);
   res.json(rows.map(serializeDocument));
+}));
+
+app.get("/api/verification-items", asyncHandler(async (req, res) => {
+  await pingDb();
+  if (!dbAvailable) {
+    if (isAdminRequest(req)) return res.json(memoryVerificationItems.map(serializeVerificationItem));
+    const allowed = memoryClientIdsForRequest(req);
+    const taskIds = new Set(memoryDues.filter((task) => allowed.has(task.client_id)).map((task) => task.id));
+    return res.json(memoryVerificationItems.filter((item) => taskIds.has(item.task_id)).map(serializeVerificationItem));
+  }
+  await ensureVerificationItemsTable();
+  if (isAdminRequest(req)) {
+    const [rows] = await pool.query("SELECT * FROM verification_items ORDER BY created_at DESC");
+    return res.json(rows.map((row) => serializeVerificationItem({
+      ...row,
+      details: typeof row.details_json === "string" ? JSON.parse(row.details_json || "[]") : (row.details_json || []),
+      audit: typeof row.audit_json === "string" ? JSON.parse(row.audit_json || "[]") : (row.audit_json || [])
+    })));
+  }
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = sqlScope(allowed, "d.client_id");
+  const [rows] = await pool.query(
+    `SELECT v.* FROM verification_items v JOIN due_tasks d ON d.id = v.task_id WHERE ${scope.clause} ORDER BY v.created_at DESC`,
+    scope.params
+  );
+  res.json(rows.map((row) => serializeVerificationItem({
+    ...row,
+    details: typeof row.details_json === "string" ? JSON.parse(row.details_json || "[]") : (row.details_json || []),
+    audit: typeof row.audit_json === "string" ? JSON.parse(row.audit_json || "[]") : (row.audit_json || [])
+  })));
 }));
 
 app.post("/api/documents", asyncHandler(async (req, res) => {
@@ -2052,6 +2492,9 @@ app.post("/api/documents", asyncHandler(async (req, res) => {
     return res.status(400).json({ error: "Document file content is required." });
   }
   await pingDb();
+  if (!(await canAccessClientId(req, document.client_id))) {
+    return res.status(403).json({ error: "You do not have access to this customer document." });
+  }
   if (!dbAvailable) {
     upsertMemoryItem(memoryDocuments, document);
     return res.status(201).json(serializeDocument(document));
@@ -2084,11 +2527,17 @@ app.delete("/api/documents/:id", asyncHandler(async (req, res) => {
   if (!id) return res.status(400).json({ error: "Document id is required." });
   await pingDb();
   if (!dbAvailable) {
-    const index = memoryDocuments.findIndex((document) => document.id === id);
+    const document = memoryDocuments.find((item) => item.id === id);
+    if (!document) return res.status(404).json({ error: "Document not found." });
+    if (!(await canAccessClientId(req, document.client_id))) return res.status(403).json({ error: "You do not have access to this document." });
+    const index = memoryDocuments.findIndex((item) => item.id === id);
     if (index >= 0) memoryDocuments.splice(index, 1);
     return res.json({ ok: true, deleted: id });
   }
   await ensureDocumentsTable();
+  const [rows] = await pool.query("SELECT client_id FROM documents WHERE id = ?", [id]);
+  if (!rows.length) return res.status(404).json({ error: "Document not found." });
+  if (!(await canAccessClientId(req, rows[0].client_id))) return res.status(403).json({ error: "You do not have access to this document." });
   await pool.query("DELETE FROM documents WHERE id = ?", [id]);
   res.json({ ok: true, deleted: id });
 }));
@@ -2117,6 +2566,7 @@ app.get("/api/whatsapp-templates", asyncHandler(async (req, res) => {
 }));
 
 app.put("/api/whatsapp-templates", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
   const incoming = Array.isArray(req.body?.templates) ? req.body.templates : [];
   const templates = incoming
     .map(normalizeWhatsAppTemplate)
@@ -2135,16 +2585,35 @@ app.put("/api/whatsapp-templates", asyncHandler(async (req, res) => {
 
 app.get("/api/whatsapp-logs", asyncHandler(async (req, res) => {
   await pingDb();
-  if (!dbAvailable) return res.json(memoryWhatsAppLogs.map(serializeWhatsAppMessage));
+  if (!dbAvailable) {
+    const rows = isAdminRequest(req)
+      ? memoryWhatsAppLogs
+      : memoryWhatsAppLogs.filter((message) => isCustomerRequest(req)
+        ? message.client_id === req.auth.clientId
+        : message.caller_id === req.auth.userId);
+    return res.json(rows.map(serializeWhatsAppMessage));
+  }
   await ensureWhatsAppMessagesTable();
-  const [rows] = await pool.query("SELECT * FROM whatsapp_messages ORDER BY updated_at DESC, created_at DESC");
+  const scope = isAdminRequest(req)
+    ? null
+    : isCustomerRequest(req)
+      ? { clause: "client_id = ?", params: [req.auth.clientId] }
+      : { clause: "caller_id = ?", params: [req.auth.userId] };
+  const [rows] = await pool.query(`SELECT * FROM whatsapp_messages${scope ? ` WHERE ${scope.clause}` : ""} ORDER BY updated_at DESC, created_at DESC`, scope?.params || []);
   res.json(rows.map(serializeWhatsAppMessage));
 }));
 
 app.post("/api/whatsapp-logs", asyncHandler(async (req, res) => {
+  if (req.auth.role === "Customer" || req.auth.role === "Owner") return res.status(403).json({ error: "Only Admin or Caller can log WhatsApp messages." });
   const message = normalizeWhatsAppMessage(req.body || {});
   if (!message.task_id || !message.client_id || !message.body) {
     return res.status(400).json({ error: "taskId, clientId and body are required." });
+  }
+  if (!isAdminRequest(req) && message.caller_id !== req.auth.userId) {
+    return res.status(403).json({ error: "You can only log your own WhatsApp messages." });
+  }
+  if (!(await canAccessClientId(req, message.client_id))) {
+    return res.status(403).json({ error: "You do not have access to this customer." });
   }
   await pingDb();
   if (!dbAvailable) {
@@ -2171,12 +2640,15 @@ app.patch("/api/whatsapp-logs/:id", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     const message = memoryWhatsAppLogs.find((item) => item.id === id);
     if (!message) return res.status(404).json({ error: "WhatsApp message not found." });
+    if (!isAdminRequest(req) && message.caller_id !== req.auth.userId) return res.status(403).json({ error: "You do not have access to this WhatsApp message." });
     message.status = status;
     message.updated_at = updatedAt;
     return res.json(serializeWhatsAppMessage(message));
   }
   await ensureWhatsAppMessagesTable();
-  const [result] = await pool.query("UPDATE whatsapp_messages SET status = ?, updated_at = ? WHERE id = ?", [status, updatedAt, id]);
+  const scope = isAdminRequest(req) ? "" : " AND caller_id = ?";
+  const params = isAdminRequest(req) ? [status, updatedAt, id] : [status, updatedAt, id, req.auth.userId];
+  const [result] = await pool.query(`UPDATE whatsapp_messages SET status = ?, updated_at = ? WHERE id = ?${scope}`, params);
   if (!result.affectedRows) return res.status(404).json({ error: "WhatsApp message not found." });
   const [rows] = await pool.query("SELECT * FROM whatsapp_messages WHERE id = ?", [id]);
   res.json(serializeWhatsAppMessage(rows[0]));
@@ -2185,10 +2657,20 @@ app.patch("/api/whatsapp-logs/:id", asyncHandler(async (req, res) => {
 app.get("/api/marketplace-threads", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
-    return res.json(memoryMarketplaceThreads.map(serializeMarketplaceThread));
+    const allowed = memoryClientIdsForRequest(req);
+    const rows = req.auth.role === "Caller" ? [] : (allowed
+      ? memoryMarketplaceThreads.filter((thread) => allowed.has(thread.buyer_client_id) || allowed.has(thread.seller_client_id))
+      : memoryMarketplaceThreads);
+    return res.json(rows.map(serializeMarketplaceThread));
   }
   await ensureMarketplaceThreadsTable();
-  const [rows] = await pool.query("SELECT * FROM marketplace_threads ORDER BY updated_at DESC");
+  if (req.auth.role === "Caller") return res.json([]);
+  const allowed = await mysqlClientIdsForRequest(req);
+  const scope = allowed ? sqlScope(allowed, "buyer_client_id") : null;
+  const sellerScope = allowed ? sqlScope(allowed, "seller_client_id") : null;
+  const params = allowed ? [...allowed, ...allowed] : [];
+  const clause = allowed ? `( ${scope.clause} OR ${sellerScope.clause} )` : "";
+  const [rows] = await pool.query(`SELECT * FROM marketplace_threads${clause ? ` WHERE ${clause}` : ""} ORDER BY updated_at DESC`, params);
   res.json(rows.map((row) => serializeMarketplaceThread(normalizeMarketplaceThread(row))));
 }));
 
@@ -2196,6 +2678,10 @@ app.post("/api/marketplace-threads", asyncHandler(async (req, res) => {
   const thread = normalizeMarketplaceThread(req.body || {});
   if (!thread.listing_id) {
     return res.status(400).json({ error: "listingId is required." });
+  }
+  if (req.auth.role === "Caller") return res.status(403).json({ error: "Caller access to marketplace chat is not allowed." });
+  if (!(await canAccessClientId(req, thread.buyer_client_id)) && !(await canAccessClientId(req, thread.seller_client_id))) {
+    return res.status(403).json({ error: "You do not have access to this marketplace conversation." });
   }
   await pingDb();
   if (!dbAvailable) {
@@ -2241,7 +2727,12 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const importRows = Array.isArray(req.body?.importRows) ? req.body.importRows.map(normalizeImportRow) : [];
   const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
   const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
+  const verificationItems = Array.isArray(req.body?.verificationItems) ? req.body.verificationItems.map(normalizeVerificationItem).filter((row) => row.id && row.task_id) : null;
   const marketplaceThreads = Array.isArray(req.body?.marketplaceThreads) ? req.body.marketplaceThreads.map(normalizeMarketplaceThread).filter((row) => row.id && row.listing_id) : null;
+  if (!isAdminRequest(req)) {
+    const scoped = await syncScopedData(req, { incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
+    return res.json({ ok: true, mode: dbAvailable ? "mysql-scoped" : "memory-scoped", synced: scoped });
+  }
   const dueTasks = appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs);
 
   await pingDb();
@@ -2255,6 +2746,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     replaceMemoryCollection(memoryImportRows, importRows);
     replaceMemoryCollection(memoryClientImports, clientImports);
     if (documents) replaceMemoryCollection(memoryDocuments, documents);
+    if (verificationItems) replaceMemoryCollection(memoryVerificationItems, verificationItems);
     if (marketplaceThreads) replaceMemoryCollection(memoryMarketplaceThreads, marketplaceThreads);
     for (const client of clients) {
       await ensureCustomerUserForClient(client);
@@ -2262,7 +2754,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     return res.json({
       ok: true,
       mode: "memory",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length, marketplaceThreads: marketplaceThreads?.length ?? memoryMarketplaceThreads.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length, verificationItems: verificationItems?.length ?? memoryVerificationItems.length, marketplaceThreads: marketplaceThreads?.length ?? memoryMarketplaceThreads.length }
     });
   }
 
@@ -2272,6 +2764,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     await ensureClientImportsTable(conn);
     await ensureDocumentsTable(conn);
+    await ensureVerificationItemsTable(conn);
     await ensureMarketplaceThreadsTable(conn);
     const clientCallerIds = await validUserIdSet(conn, clients);
     const dueCallerIds = await validUserIdSet(conn, dueTasks);
@@ -2402,6 +2895,16 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
         );
       }
     }
+    if (verificationItems) {
+      for (const item of verificationItems) {
+        await conn.query(
+          `REPLACE INTO verification_items
+            (id, task_id, submitted_by, submitted_at, proof_type, details_json, audit_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [item.id, item.task_id, item.submitted_by, item.submitted_at, item.proof_type, JSON.stringify(item.details), JSON.stringify(item.audit)]
+        );
+      }
+    }
     if (marketplaceThreads) {
       for (const thread of marketplaceThreads) {
         await conn.query(
@@ -2477,6 +2980,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await deleteMissingRows(conn, "audit_logs", auditLogs.map((item) => item.id));
     await deleteMissingRows(conn, "client_imports", clientImports.map((item) => item.id));
     if (marketplaceThreads) await deleteMissingRows(conn, "marketplace_threads", marketplaceThreads.map((item) => item.id));
+    if (verificationItems) await deleteMissingRows(conn, "verification_items", verificationItems.map((item) => item.id));
     await deleteMissingRows(conn, "listings", listings.map((item) => item.id));
     await deleteMissingRows(conn, "due_tasks", dueTasks.map((item) => item.id));
     await deleteMissingRows(conn, "vehicles", vehicles.map((item) => item.id));
@@ -2485,7 +2989,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     res.json({
       ok: true,
       mode: "mysql",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0, marketplaceThreads: marketplaceThreads?.length ?? 0 }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0, verificationItems: verificationItems?.length ?? 0, marketplaceThreads: marketplaceThreads?.length ?? 0 }
     });
   } catch (err) {
     await conn.rollback();

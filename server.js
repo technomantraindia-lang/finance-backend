@@ -35,6 +35,8 @@ let documentsReady = false;
 let documentsPromise = null;
 let verificationItemsReady = false;
 let verificationItemsPromise = null;
+let saleClosingsReady = false;
+let saleClosingsPromise = null;
 let marketplaceThreadsReady = false;
 let marketplaceThreadsPromise = null;
 let whatsappMessagesReady = false;
@@ -139,6 +141,7 @@ const memoryImportRows = [];
 const memoryClientImports = [];
 const memoryDocuments = [];
 const memoryVerificationItems = [];
+const memorySaleClosings = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
 const defaultRolePermissions = [
@@ -414,7 +417,8 @@ function normalizeListing(row) {
     location: row.location || "",
     status: row.status || "Submitted",
     condition_note: row.condition || row.condition_note || "Good",
-    photos: Array.isArray(photos) ? photos : []
+    photos: Array.isArray(photos) ? photos : [],
+    createdAt: row.createdAt || row.created_at || ""
   };
 }
 
@@ -475,6 +479,52 @@ function serializeVerificationItem(row) {
     proofType: row.proof_type,
     details: Array.isArray(row.details) ? row.details : [],
     audit: Array.isArray(row.audit) ? row.audit : []
+  };
+}
+
+function normalizeSaleClosingFile(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    fileName: String(value.fileName || value.file_name || "document"),
+    mimeType: String(value.mimeType || value.mime_type || "application/octet-stream"),
+    size: Number(value.size || value.size_bytes || 0),
+    dataUrl: String(value.dataUrl || value.data_url || ""),
+    uploadedAt: value.uploadedAt || value.uploaded_at || new Date().toLocaleString("en-IN")
+  };
+}
+
+function normalizeSaleClosing(row) {
+  const status = ["Estimated", "Bank Confirmed", "Sold"].includes(row.status) ? row.status : "Estimated";
+  return {
+    id: String(row.id || `sc-${Date.now()}`),
+    listing_id: String(row.listingId || row.listing_id || ""),
+    vehicle_id: String(row.vehicleId || row.vehicle_id || ""),
+    client_id: String(row.clientId || row.client_id || ""),
+    estimated_amount: Number(row.estimatedAmount || row.estimated_amount || 0),
+    bank_confirmed_amount: Number(row.bankConfirmedAmount || row.bank_confirmed_amount || 0),
+    foreclosure_statement: normalizeSaleClosingFile(row.foreclosureStatement || row.foreclosure_statement),
+    bank_noc: normalizeSaleClosingFile(row.bankNoc || row.bank_noc),
+    ownership_transfer: normalizeSaleClosingFile(row.ownershipTransfer || row.ownership_transfer),
+    sold_date: row.soldDate || row.sold_date || "",
+    status,
+    updated_at: row.updatedAt || row.updated_at || new Date().toISOString()
+  };
+}
+
+function serializeSaleClosing(row) {
+  return {
+    id: row.id,
+    listingId: row.listing_id,
+    vehicleId: row.vehicle_id,
+    clientId: row.client_id,
+    estimatedAmount: Number(row.estimated_amount || 0),
+    bankConfirmedAmount: Number(row.bank_confirmed_amount || 0),
+    foreclosureStatement: row.foreclosure_statement || null,
+    bankNoc: row.bank_noc || null,
+    ownershipTransfer: row.ownership_transfer || null,
+    soldDate: row.sold_date || "",
+    status: row.status || "Estimated",
+    updatedAt: row.updated_at || ""
   };
 }
 
@@ -1202,6 +1252,7 @@ async function ensureCoreTables() {
   await ensureClientImportsTable();
   await ensureDocumentsTable();
   await ensureVerificationItemsTable();
+  await ensureSaleClosingsTable();
   await ensureMarketplaceThreadsTable();
   await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
@@ -1392,6 +1443,42 @@ async function ensureVerificationItemsTable(conn = null) {
     )`
   );
   verificationItemsReady = true;
+}
+
+async function ensureSaleClosingsTable(conn = null) {
+  if (!dbAvailable) return;
+  if (saleClosingsReady) return;
+  if (!conn && saleClosingsPromise) return saleClosingsPromise;
+  if (!conn) {
+    saleClosingsPromise = ensureSaleClosingsTable(pool)
+      .finally(() => {
+        saleClosingsPromise = null;
+      });
+    return saleClosingsPromise;
+  }
+  const query = conn ? conn.query.bind(conn) : pool.query.bind(pool);
+  await query(
+    `CREATE TABLE IF NOT EXISTS sale_closings (
+      id VARCHAR(64) PRIMARY KEY,
+      listing_id VARCHAR(48) NOT NULL,
+      vehicle_id VARCHAR(48) NOT NULL,
+      client_id VARCHAR(32) NOT NULL,
+      estimated_amount DECIMAL(14,2) DEFAULT 0,
+      bank_confirmed_amount DECIMAL(14,2) DEFAULT 0,
+      foreclosure_json JSON,
+      bank_noc_json JSON,
+      ownership_transfer_json JSON,
+      sold_date DATE NULL,
+      status VARCHAR(32) DEFAULT 'Estimated',
+      updated_at VARCHAR(64),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_sale_closings_listing (listing_id),
+      INDEX idx_sale_closings_client (client_id),
+      FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+      FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
+    )`
+  );
+  saleClosingsReady = true;
 }
 
 async function ensureMarketplaceThreadsTable(conn = null) {
@@ -2483,6 +2570,25 @@ app.get("/api/verification-items", asyncHandler(async (req, res) => {
   })));
 }));
 
+app.get("/api/sale-closings", asyncHandler(async (req, res) => {
+  await pingDb();
+  const decode = (row) => ({
+    ...row,
+    foreclosure_statement: typeof row.foreclosure_json === "string" ? JSON.parse(row.foreclosure_json || "null") : (row.foreclosure_json || null),
+    bank_noc: typeof row.bank_noc_json === "string" ? JSON.parse(row.bank_noc_json || "null") : (row.bank_noc_json || null),
+    ownership_transfer: typeof row.ownership_transfer_json === "string" ? JSON.parse(row.ownership_transfer_json || "null") : (row.ownership_transfer_json || null)
+  });
+  if (!dbAvailable) {
+    if (isAdminRequest(req)) return res.json(memorySaleClosings.map(serializeSaleClosing));
+    if (isCustomerRequest(req)) return res.json(memorySaleClosings.filter((item) => item.client_id === req.auth.clientId).map(serializeSaleClosing));
+    return res.json([]);
+  }
+  await ensureSaleClosingsTable();
+  const scope = isAdminRequest(req) ? null : isCustomerRequest(req) ? { clause: "client_id = ?", params: [req.auth.clientId] } : { clause: "1 = 0", params: [] };
+  const [rows] = await pool.query(`SELECT * FROM sale_closings${scope ? ` WHERE ${scope.clause}` : ""} ORDER BY updated_at DESC, created_at DESC`, scope?.params || []);
+  res.json(rows.map((row) => serializeSaleClosing(decode(row))));
+}));
+
 app.post("/api/documents", asyncHandler(async (req, res) => {
   const document = normalizeDocument(req.body || {});
   if (!document.client_id || !document.vehicle_id || !document.task_id) {
@@ -2728,6 +2834,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const clientImports = Array.isArray(req.body?.clientImports) ? req.body.clientImports.map(normalizeClientImport).filter((row) => row.id && row.client_id) : [];
   const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
   const verificationItems = Array.isArray(req.body?.verificationItems) ? req.body.verificationItems.map(normalizeVerificationItem).filter((row) => row.id && row.task_id) : null;
+  const saleClosings = Array.isArray(req.body?.saleClosings) ? req.body.saleClosings.map(normalizeSaleClosing).filter((row) => row.id && row.listing_id && row.vehicle_id && row.client_id) : null;
   const marketplaceThreads = Array.isArray(req.body?.marketplaceThreads) ? req.body.marketplaceThreads.map(normalizeMarketplaceThread).filter((row) => row.id && row.listing_id) : null;
   if (!isAdminRequest(req)) {
     const scoped = await syncScopedData(req, { incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
@@ -2747,6 +2854,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     replaceMemoryCollection(memoryClientImports, clientImports);
     if (documents) replaceMemoryCollection(memoryDocuments, documents);
     if (verificationItems) replaceMemoryCollection(memoryVerificationItems, verificationItems);
+    if (saleClosings) replaceMemoryCollection(memorySaleClosings, saleClosings);
     if (marketplaceThreads) replaceMemoryCollection(memoryMarketplaceThreads, marketplaceThreads);
     for (const client of clients) {
       await ensureCustomerUserForClient(client);
@@ -2754,7 +2862,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     return res.json({
       ok: true,
       mode: "memory",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length, verificationItems: verificationItems?.length ?? memoryVerificationItems.length, marketplaceThreads: marketplaceThreads?.length ?? memoryMarketplaceThreads.length }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? memoryDocuments.length, verificationItems: verificationItems?.length ?? memoryVerificationItems.length, saleClosings: saleClosings?.length ?? memorySaleClosings.length, marketplaceThreads: marketplaceThreads?.length ?? memoryMarketplaceThreads.length }
     });
   }
 
@@ -2765,6 +2873,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await ensureClientImportsTable(conn);
     await ensureDocumentsTable(conn);
     await ensureVerificationItemsTable(conn);
+    await ensureSaleClosingsTable(conn);
     await ensureMarketplaceThreadsTable(conn);
     const clientCallerIds = await validUserIdSet(conn, clients);
     const dueCallerIds = await validUserIdSet(conn, dueTasks);
@@ -2905,6 +3014,16 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
         );
       }
     }
+    if (saleClosings) {
+      for (const closing of saleClosings) {
+        await conn.query(
+          `REPLACE INTO sale_closings
+            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, status, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.status, closing.updated_at]
+        );
+      }
+    }
     if (marketplaceThreads) {
       for (const thread of marketplaceThreads) {
         await conn.query(
@@ -2981,6 +3100,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     await deleteMissingRows(conn, "client_imports", clientImports.map((item) => item.id));
     if (marketplaceThreads) await deleteMissingRows(conn, "marketplace_threads", marketplaceThreads.map((item) => item.id));
     if (verificationItems) await deleteMissingRows(conn, "verification_items", verificationItems.map((item) => item.id));
+    if (saleClosings) await deleteMissingRows(conn, "sale_closings", saleClosings.map((item) => item.id));
     await deleteMissingRows(conn, "listings", listings.map((item) => item.id));
     await deleteMissingRows(conn, "due_tasks", dueTasks.map((item) => item.id));
     await deleteMissingRows(conn, "vehicles", vehicles.map((item) => item.id));
@@ -2989,7 +3109,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     res.json({
       ok: true,
       mode: "mysql",
-      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0, verificationItems: verificationItems?.length ?? 0, marketplaceThreads: marketplaceThreads?.length ?? 0 }
+      synced: { clients: clients.length, vehicles: vehicles.length, dueTasks: dueTasks.length, listings: listings.length, callerActivities: callerActivities.length, auditLogs: auditLogs.length, importRows: importRows.length, clientImports: clientImports.length, documents: documents?.length ?? 0, verificationItems: verificationItems?.length ?? 0, saleClosings: saleClosings?.length ?? 0, marketplaceThreads: marketplaceThreads?.length ?? 0 }
     });
   } catch (err) {
     await conn.rollback();

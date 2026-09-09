@@ -2174,6 +2174,101 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "mysql" });
 }));
 
+// Delete a client, its customer account and every dependent record.
+app.delete("/api/clients/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const clientId = String(req.params.id || "").trim();
+  if (!clientId) return res.status(400).json({ error: "Client id is required." });
+  await pingDb();
+
+  if (!dbAvailable) {
+    const clientIndex = memoryClients.findIndex((client) => client.id === clientId);
+    if (clientIndex === -1) return res.status(404).json({ error: "Client not found." });
+    const client = memoryClients[clientIndex];
+    const vehicleIds = new Set(memoryVehicles.filter((vehicle) => vehicle.client_id === clientId).map((vehicle) => vehicle.id));
+    const taskIds = new Set(memoryDues.filter((task) => task.client_id === clientId).map((task) => task.id));
+    const accountIds = new Set(memoryUsers
+      .filter((user) => ["Customer", "Owner"].includes(user.role)
+        && ((clientId.startsWith("c-") && user.id === `u-${clientId.slice(2)}`) || user.email === client.email))
+      .map((user) => user.id));
+    for (let index = memoryCallerActivities.length - 1; index >= 0; index -= 1) {
+      if (taskIds.has(memoryCallerActivities[index].task_id)) memoryCallerActivities.splice(index, 1);
+    }
+    for (let index = memoryVerificationItems.length - 1; index >= 0; index -= 1) {
+      if (taskIds.has(memoryVerificationItems[index].task_id)) memoryVerificationItems.splice(index, 1);
+    }
+    for (let index = memoryClientImports.length - 1; index >= 0; index -= 1) {
+      if (memoryClientImports[index].client_id === clientId) memoryClientImports.splice(index, 1);
+    }
+    for (let index = memoryDocuments.length - 1; index >= 0; index -= 1) {
+      if (memoryDocuments[index].client_id === clientId) memoryDocuments.splice(index, 1);
+    }
+    for (let index = memorySaleClosings.length - 1; index >= 0; index -= 1) {
+      if (memorySaleClosings[index].client_id === clientId) memorySaleClosings.splice(index, 1);
+    }
+    for (let index = memoryMarketplaceThreads.length - 1; index >= 0; index -= 1) {
+      const thread = memoryMarketplaceThreads[index];
+      if (thread.buyer_client_id === clientId || thread.seller_client_id === clientId) memoryMarketplaceThreads.splice(index, 1);
+    }
+    for (let index = memoryListings.length - 1; index >= 0; index -= 1) {
+      if (vehicleIds.has(memoryListings[index].vehicle_id)) memoryListings.splice(index, 1);
+    }
+    for (let index = memoryDues.length - 1; index >= 0; index -= 1) {
+      if (taskIds.has(memoryDues[index].id)) memoryDues.splice(index, 1);
+    }
+    for (let index = memoryVehicles.length - 1; index >= 0; index -= 1) {
+      if (vehicleIds.has(memoryVehicles[index].id)) memoryVehicles.splice(index, 1);
+    }
+    memoryClients.splice(clientIndex, 1);
+    for (let index = memoryUsers.length - 1; index >= 0; index -= 1) {
+      if (accountIds.has(memoryUsers[index].id)) memoryUsers.splice(index, 1);
+    }
+    return res.json({ ok: true, id: clientId, mode: "memory" });
+  }
+
+  const [clientRows] = await pool.query("SELECT id, email FROM clients WHERE id = ?", [clientId]);
+  if (!clientRows.length) return res.status(404).json({ error: "Client not found." });
+  const client = clientRows[0];
+  const accountId = clientId.startsWith("c-u-")
+    ? clientId.slice(2)
+    : clientId.startsWith("c-")
+      ? `u-${clientId.slice(2)}`
+      : clientId.startsWith("u-") ? clientId : "";
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await ensureClientImportsTable(conn);
+    await ensureDocumentsTable(conn);
+    await ensureVerificationItemsTable(conn);
+    await ensureSaleClosingsTable(conn);
+    await ensureMarketplaceThreadsTable(conn);
+    const [accountRows] = await conn.query(
+      "SELECT id FROM users WHERE role IN ('Customer', 'Owner') AND (id = ? OR (? <> '' AND email = ?))",
+      [accountId, client.email || "", client.email || ""]
+    );
+    await conn.query("DELETE FROM caller_activities WHERE task_id IN (SELECT id FROM due_tasks WHERE client_id = ?)", [clientId]);
+    await conn.query("DELETE FROM verification_items WHERE task_id IN (SELECT id FROM due_tasks WHERE client_id = ?)", [clientId]);
+    await conn.query("DELETE FROM client_imports WHERE client_id = ?", [clientId]);
+    await conn.query("DELETE FROM documents WHERE client_id = ?", [clientId]);
+    await conn.query("DELETE FROM marketplace_threads WHERE buyer_client_id = ? OR seller_client_id = ?", [clientId, clientId]);
+    await conn.query("DELETE FROM sale_closings WHERE client_id = ?", [clientId]);
+    await conn.query("DELETE FROM listings WHERE vehicle_id IN (SELECT id FROM vehicles WHERE client_id = ?)", [clientId]);
+    await conn.query("DELETE FROM due_tasks WHERE client_id = ?", [clientId]);
+    await conn.query("DELETE FROM vehicles WHERE client_id = ?", [clientId]);
+    await conn.query("DELETE FROM clients WHERE id = ?", [clientId]);
+    for (const account of accountRows) {
+      await conn.query("DELETE FROM users WHERE id = ?", [account.id]);
+    }
+    await conn.commit();
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+  res.json({ ok: true, id: clientId, mode: "mysql" });
+}));
+
 // Delete a customer account + client
 app.delete("/api/users/:id", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;

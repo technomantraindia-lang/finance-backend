@@ -786,12 +786,37 @@ function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, a
 function importRowDueCandidates(row, vehicle, client) {
   const clientId = vehicle?.client_id || client?.id;
   const vehicleId = vehicle?.id;
+  let schedule = row?.emiSchedule || row?.emi_schedule;
+  if (typeof schedule === "string") {
+    try { schedule = JSON.parse(schedule || "[]"); } catch { schedule = []; }
+  }
+  const scheduleDueCandidates = (Array.isArray(schedule) ? schedule : [])
+    .filter((entry) => entry?.status !== "Paid" && entry?.dueDate)
+    .map((entry) => buildDueCandidate({
+      clientId,
+      vehicleId,
+      type: "EMI",
+      date: entry.dueDate,
+      callerId: client?.caller_id,
+      amount: Number(entry.amount || entry.installmentAmount || 0)
+    }))
+    .filter(Boolean);
+  const emiCandidates = scheduleDueCandidates.length > 0
+    ? scheduleDueCandidates
+    : [buildDueCandidate({
+        clientId,
+        vehicleId,
+        type: "EMI",
+        date: row.emiEnd || row.emiStart,
+        callerId: client?.caller_id,
+        amount: Number(String(row.emiAmount || "").replace(/\D/g, "")) || 0
+      })].filter(Boolean);
   return [
     buildDueCandidate({ clientId, vehicleId, type: "Insurance", date: row.policyEnd, callerId: client?.caller_id }),
     buildDueCandidate({ clientId, vehicleId, type: "Permit", date: row.permitExpired || row.nationalPermitExpired, callerId: client?.caller_id }),
     buildDueCandidate({ clientId, vehicleId, type: "Fitness", date: row.fitnessExpired, callerId: client?.caller_id }),
     buildDueCandidate({ clientId, vehicleId, type: "PUC", date: row.pucExpired, callerId: client?.caller_id }),
-    buildDueCandidate({ clientId, vehicleId, type: "EMI", date: row.emiEnd, callerId: client?.caller_id, amount: Number(String(row.emiAmount || "").replace(/\D/g, "")) || 0 })
+    ...emiCandidates
   ].filter(Boolean);
 }
 
@@ -1442,6 +1467,25 @@ async function ensureVerificationItemsTable(conn = null) {
       FOREIGN KEY (task_id) REFERENCES due_tasks(id) ON DELETE CASCADE
     )`
   );
+  // Older deployments used `details` and `audit`; keep them readable while migrating
+  // to the explicit JSON column names used by the current API.
+  const [existingColumns] = await query("SHOW COLUMNS FROM verification_items");
+  const columnNames = new Set(existingColumns.map((column) => column.Field));
+  const migrations = [
+    ["details_json", "ALTER TABLE verification_items ADD COLUMN details_json JSON NULL"],
+    ["audit_json", "ALTER TABLE verification_items ADD COLUMN audit_json JSON NULL"]
+  ];
+  for (const [name, statement] of migrations) {
+    if (columnNames.has(name)) continue;
+    await query(statement);
+    columnNames.add(name);
+  }
+  if (columnNames.has("details")) {
+    await query("UPDATE verification_items SET details_json = details WHERE details_json IS NULL AND details IS NOT NULL");
+  }
+  if (columnNames.has("audit")) {
+    await query("UPDATE verification_items SET audit_json = audit WHERE audit_json IS NULL AND audit IS NOT NULL");
+  }
   verificationItemsReady = true;
 }
 

@@ -126,8 +126,8 @@ CREATE TABLE IF NOT EXISTS verification_items (
   submitted_by VARCHAR(120),
   submitted_at VARCHAR(64),
   proof_type VARCHAR(80),
-  details JSON,
-  audit JSON,
+  details_json JSON,
+  audit_json JSON,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (task_id) REFERENCES due_tasks(id) ON DELETE CASCADE
 );

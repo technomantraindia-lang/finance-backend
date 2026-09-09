@@ -2450,10 +2450,32 @@ app.post("/api/change-password", asyncHandler(async (req, res) => {
 app.get("/api/clients", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
+    if (isAdminRequest(req)) {
+      for (const user of memoryUsers.filter((item) => ["Customer", "Owner"].includes(item.role))) {
+        const clientId = user.id.startsWith("u-") ? `c-${user.id.slice(2)}` : "";
+        if (clientId && !memoryClients.some((client) => client.id === clientId)) {
+          memoryClients.push({ id: clientId, name: user.name, email: user.email || "", city: "", phone: "", caller_id: null });
+        }
+      }
+    }
     const allowed = memoryClientIdsForRequest(req);
     return res.json(allowed ? memoryClients.filter((client) => allowed.has(client.id)) : memoryClients);
   }
   await ensureClientsEmailColumn();
+  if (isAdminRequest(req)) {
+    const [accountRows] = await pool.query("SELECT id, name, email FROM users WHERE role IN ('Customer', 'Owner')");
+    const [existingRows] = await pool.query("SELECT id FROM clients");
+    const existingIds = new Set(existingRows.map((row) => row.id));
+    for (const account of accountRows) {
+      const clientId = account.id.startsWith("u-") ? `c-${account.id.slice(2)}` : "";
+      if (!clientId || existingIds.has(clientId)) continue;
+      await pool.query(
+        "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
+        [clientId, account.name, account.email || ""]
+      );
+      existingIds.add(clientId);
+    }
+  }
   const allowed = await mysqlClientIdsForRequest(req);
   const scope = allowed ? sqlScope(allowed, "id") : null;
   const [rows] = await pool.query(`SELECT * FROM clients${scope ? ` WHERE ${scope.clause}` : ""}`, scope?.params || []);

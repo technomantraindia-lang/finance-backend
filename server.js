@@ -91,8 +91,10 @@ let lastCallerAssignmentResult = {
   callers: 0,
   error: ""
 };
-const authSessions = new Map();
 const SESSION_TTL_MS = Math.max(15 * 60 * 1000, Number(process.env.SESSION_TTL_HOURS || 24) * 60 * 60 * 1000);
+// Signed sessions remain valid after a process restart and across load-balanced
+// backend instances. Set SESSION_SECRET to one stable production secret.
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.DB_PASSWORD || "kuber-finance-session-secret";
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
@@ -1617,16 +1619,17 @@ const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 function issueSession(user, clientId = null) {
-  const token = crypto.randomBytes(32).toString("hex");
-  authSessions.set(token, {
+  const payload = {
     userId: user.id,
     name: user.name,
     role: user.role,
     email: user.email,
     clientId,
     expiresAt: Date.now() + SESSION_TTL_MS
-  });
-  return token;
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
 }
 
 function readBearerToken(req) {
@@ -1636,12 +1639,23 @@ function readBearerToken(req) {
 
 function authenticateRequest(req, res, next) {
   const token = readBearerToken(req);
-  const session = token ? authSessions.get(token) : null;
-  if (!session || session.expiresAt <= Date.now()) {
-    if (token) authSessions.delete(token);
+  const [encoded, signature] = token.split(".");
+  let session = null;
+  if (encoded && signature) {
+    const expectedSignature = crypto.createHmac("sha256", SESSION_SECRET).update(encoded).digest("base64url");
+    const providedBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+    if (providedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(providedBuffer, expectedBuffer)) {
+      try {
+        session = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+      } catch {
+        session = null;
+      }
+    }
+  }
+  if (!session || !session.userId || session.expiresAt <= Date.now()) {
     return res.status(401).json({ error: "Authentication required. Please log in again." });
   }
-  session.expiresAt = Date.now() + SESSION_TTL_MS;
   req.auth = { ...session, token };
   next();
 }

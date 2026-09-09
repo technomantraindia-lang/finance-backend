@@ -2214,8 +2214,14 @@ app.delete("/api/users/:id", asyncHandler(async (req, res) => {
     await conn.beginTransaction();
     await conn.query("UPDATE due_tasks SET caller_id = NULL WHERE caller_id = ?", [id]);
     await conn.query("UPDATE clients SET caller_id = NULL WHERE caller_id = ?", [id]);
+    if (userRows[0].role === "Customer") {
+      const clientId = `c-${id.slice(2)}`;
+      // Older databases may have client_imports without ON DELETE CASCADE.
+      // Remove that child data explicitly before deleting the client row.
+      await conn.query("DELETE FROM client_imports WHERE client_id = ?", [clientId]);
+      await conn.query("DELETE FROM clients WHERE id = ?", [clientId]);
+    }
     await conn.query("DELETE FROM users WHERE id = ?", [id]);
-    if (userRows[0].role === "Customer") await conn.query("DELETE FROM clients WHERE id = ?", [`c-${id.slice(2)}`]);
     await conn.commit();
   } catch (error) {
     await conn.rollback();

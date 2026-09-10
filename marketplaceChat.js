@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 
+const CHAT_RETENTION_DAYS = 7;
 const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
 const isClient = (auth) => ["Customer", "Owner"].includes(auth.role) && auth.clientId;
 const participant = (auth, thread) => isClient(auth) && [thread.buyer_client_id, thread.seller_client_id].includes(auth.clientId);
@@ -85,6 +86,17 @@ function createMysqlStore(pool, ensureThreads) {
   }
   const joined = "SELECT t.*, l.title, v.reg_no AS registration, requester.name AS requester_name, owner.name AS owner_name FROM marketplace_threads t LEFT JOIN listings l ON l.id = t.listing_id LEFT JOIN vehicles v ON v.id = l.vehicle_id LEFT JOIN clients requester ON requester.id = t.buyer_client_id LEFT JOIN clients owner ON owner.id = t.seller_client_id";
   return {
+    async cleanupExpired() {
+      await ensure();
+      const [result] = await pool.query(
+        "DELETE FROM marketplace_threads WHERE COALESCE(" +
+          "STR_TO_DATE(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ'), " +
+          "STR_TO_DATE(updated_at, '%Y-%m-%dT%H:%i:%sZ'), " +
+          "STR_TO_DATE(updated_at, '%e/%c/%Y, %l:%i:%s %p')" +
+        ") < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${CHAT_RETENTION_DAYS} DAY)"
+      );
+      return result.affectedRows || 0;
+    },
     async list(auth) {
       await ensure();
       const admin = auth.role === "Admin";
@@ -139,6 +151,7 @@ function createMysqlStore(pool, ensureThreads) {
 
 function mountMarketplaceChat(app, store) {
   const subscribers = new Set();
+  let cleanupBusy = false;
   const wrap = (handler) => async (req, res, next) => {
     try { await handler(req, res); } catch (error) {
       if (error.status) res.status(error.status).json({ error: error.message });
@@ -146,6 +159,20 @@ function mountMarketplaceChat(app, store) {
     }
   };
   const changed = () => { for (const refresh of subscribers) refresh(); };
+  const cleanupExpired = async () => {
+    if (cleanupBusy || !store.cleanupExpired) return;
+    cleanupBusy = true;
+    try {
+      const deleted = await store.cleanupExpired();
+      if (deleted) changed();
+    } catch (error) {
+      console.error("[marketplace-chat] cleanup failed:", error.message);
+    } finally {
+      cleanupBusy = false;
+    }
+  };
+  void cleanupExpired();
+  setInterval(cleanupExpired, 24 * 60 * 60 * 1000);
   app.get("/api/marketplace-chat/threads", wrap(async (req, res) => {
     res.set("Cache-Control", "no-store").json((await store.list(req.auth)).map(serialize));
   }));
@@ -195,4 +222,3 @@ function mountMarketplaceChat(app, store) {
 }
 
 module.exports = { mountMarketplaceChat, createMysqlStore, applyAction, serialize };
-

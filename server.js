@@ -2592,9 +2592,28 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
     const allowed = memoryClientIdsForRequest(req);
+    if (isCustomerRequest(req)) {
+      return res.json(memoryDues.filter((task) => {
+        if (!allowed.has(task.client_id)) return false;
+        const vehicle = memoryVehicles.find((item) => item.id === task.vehicle_id);
+        return String(vehicle?.status || "").toLowerCase() !== "sold";
+      }));
+    }
     return res.json(allowed ? memoryDues.filter((task) => allowed.has(task.client_id)) : memoryDues);
   }
   const allowed = await mysqlClientIdsForRequest(req);
+  if (isCustomerRequest(req)) {
+    const scope = sqlScope(allowed, "d.client_id");
+    const [rows] = await pool.query(
+      "SELECT d.*, c.name AS client_name, v.reg_no AS vehicle_reg_no " +
+      "FROM due_tasks d " +
+      "LEFT JOIN clients c ON c.id = d.client_id " +
+      "LEFT JOIN vehicles v ON v.id = d.vehicle_id " +
+      "WHERE " + scope.clause + " AND (v.status IS NULL OR v.status <> 'Sold')",
+      scope.params
+    );
+    return res.json(rows);
+  }
   const scope = allowed ? sqlScope(allowed, "d.client_id") : null;
   const [rows] = await pool.query(
     `SELECT d.*, c.name AS client_name, v.reg_no AS vehicle_reg_no

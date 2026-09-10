@@ -3,6 +3,7 @@ const mysql = require("mysql2/promise");
 const cors = require("cors");
 const crypto = require("crypto");
 const path = require("path");
+const { mountMarketplaceChat, createMysqlStore } = require("./marketplaceChat");
 require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
 require("dotenv").config();
 
@@ -1749,11 +1750,7 @@ async function syncScopedData(req, payload) {
         if (allowed.has(memoryDocuments[index].client_id)) memoryDocuments.splice(index, 1);
       }
       memoryDocuments.push(...ownDocuments);
-      for (let index = memoryMarketplaceThreads.length - 1; index >= 0; index -= 1) {
-        const item = memoryMarketplaceThreads[index];
-        if (allowed.has(item.buyer_client_id) || allowed.has(item.seller_client_id)) memoryMarketplaceThreads.splice(index, 1);
-      }
-      memoryMarketplaceThreads.push(...ownThreads);
+
       return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: ownDocuments.length, verificationItems: verifiedItems.length, marketplaceThreads: ownThreads.length };
     }
     const conn = await pool.getConnection();
@@ -1810,19 +1807,7 @@ async function syncScopedData(req, payload) {
       }
       const documentIds = ownDocuments.map((item) => item.id);
       await conn.query(`DELETE FROM documents WHERE ${clientScope.clause}${documentIds.length ? ` AND id NOT IN (${documentIds.map(() => "?").join(",")})` : ""}`, [...clientScope.params, ...documentIds]);
-      for (const thread of ownThreads) {
-        await conn.query(
-          `INSERT INTO marketplace_threads
-            (id, listing_id, buyer_client_id, seller_client_id, status, messages_json, reported, blocked, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE status = VALUES(status), messages_json = VALUES(messages_json), reported = VALUES(reported), blocked = VALUES(blocked), updated_at = VALUES(updated_at)`,
-          [thread.id, thread.listing_id, thread.buyer_client_id, thread.seller_client_id, thread.status, JSON.stringify(thread.messages), thread.reported ? 1 : 0, thread.blocked ? 1 : 0, thread.updated_at]
-        );
-      }
-      const threadIds = ownThreads.map((item) => item.id);
-      const buyerScope = sqlScope([...allowed], "buyer_client_id");
-      const sellerScope = sqlScope([...allowed], "seller_client_id");
-      await conn.query(`DELETE FROM marketplace_threads WHERE (${buyerScope.clause} OR ${sellerScope.clause})${threadIds.length ? ` AND id NOT IN (${threadIds.map(() => "?").join(",")})` : ""}`, [...buyerScope.params, ...sellerScope.params, ...threadIds]);
+      const threadIds = []; // General customer sync must not replace or delete chat history.
       await conn.commit();
       return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: documentIds.length, verificationItems: verifiedItems.length, marketplaceThreads: threadIds.length };
     } catch (error) {
@@ -2961,48 +2946,12 @@ app.get("/api/marketplace-threads", asyncHandler(async (req, res) => {
   res.json(rows.map((row) => serializeMarketplaceThread(normalizeMarketplaceThread(row))));
 }));
 
-app.post("/api/marketplace-threads", asyncHandler(async (req, res) => {
-  const thread = normalizeMarketplaceThread(req.body || {});
-  if (!thread.listing_id) {
-    return res.status(400).json({ error: "listingId is required." });
-  }
-  if (req.auth.role === "Caller") return res.status(403).json({ error: "Caller access to marketplace chat is not allowed." });
-  if (!(await canAccessClientId(req, thread.buyer_client_id)) && !(await canAccessClientId(req, thread.seller_client_id))) {
-    return res.status(403).json({ error: "You do not have access to this marketplace conversation." });
-  }
-  await pingDb();
-  if (!dbAvailable) {
-    upsertMemoryItem(memoryMarketplaceThreads, thread);
-    return res.status(201).json(serializeMarketplaceThread(thread));
-  }
-  await ensureMarketplaceThreadsTable();
-  await pool.query(
-    `INSERT INTO marketplace_threads
-      (id, listing_id, buyer_client_id, seller_client_id, status, messages_json, reported, blocked, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       listing_id = VALUES(listing_id),
-       buyer_client_id = VALUES(buyer_client_id),
-       seller_client_id = VALUES(seller_client_id),
-       status = VALUES(status),
-       messages_json = VALUES(messages_json),
-       reported = VALUES(reported),
-       blocked = VALUES(blocked),
-       updated_at = VALUES(updated_at)`,
-    [
-      thread.id,
-      thread.listing_id,
-      thread.buyer_client_id,
-      thread.seller_client_id,
-      thread.status,
-      JSON.stringify(thread.messages),
-      thread.reported ? 1 : 0,
-      thread.blocked ? 1 : 0,
-      thread.updated_at
-    ]
-  );
-  res.status(201).json(serializeMarketplaceThread(thread));
-}));
+// Chat changes use authenticated request/message endpoints, never client snapshots.
+mountMarketplaceChat(app, createMysqlStore(pool, ensureMarketplaceThreadsTable));
+
+app.post("/api/marketplace-threads", (req, res) => {
+  res.status(410).json({ error: "Please update the app and use Marketplace chat requests." });
+});
 
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
@@ -3016,7 +2965,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const documents = Array.isArray(req.body?.documents) ? req.body.documents.map(normalizeDocument).filter((row) => row.id && row.client_id && row.vehicle_id && row.task_id) : null;
   const verificationItems = Array.isArray(req.body?.verificationItems) ? req.body.verificationItems.map(normalizeVerificationItem).filter((row) => row.id && row.task_id) : null;
   const saleClosings = Array.isArray(req.body?.saleClosings) ? req.body.saleClosings.map(normalizeSaleClosing).filter((row) => row.id && row.listing_id && row.vehicle_id && row.client_id) : null;
-  const marketplaceThreads = Array.isArray(req.body?.marketplaceThreads) ? req.body.marketplaceThreads.map(normalizeMarketplaceThread).filter((row) => row.id && row.listing_id) : null;
+  const marketplaceThreads = null; // Live conversations are owned by the chat endpoints.
   if (!isAdminRequest(req)) {
     const scoped = await syncScopedData(req, { incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
     return res.json({ ok: true, mode: dbAvailable ? "mysql-scoped" : "memory-scoped", synced: scoped });

@@ -2606,6 +2606,7 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     const allowed = memoryClientIdsForRequest(req);
     if (req.auth.role === "Caller") return res.json([]);
+    if (isCustomerRequest(req)) return res.json(memoryListings.filter((listing) => ["Active", "Reserved"].includes(listing.status)));
     return res.json((allowed ? memoryListings.filter((listing) => {
       const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
       return ["Active", "Reserved"].includes(listing.status) || (vehicle && allowed.has(vehicle.client_id));
@@ -2613,6 +2614,10 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
   }
   const allowed = await mysqlClientIdsForRequest(req);
   if (req.auth.role === "Caller") return res.json([]);
+  if (isCustomerRequest(req)) {
+    const [rows] = await pool.query("SELECT l.* FROM listings l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.status IN ('Active', 'Reserved')");
+    return res.json(rows.map(normalizeListing));
+  }
   const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(
     `SELECT l.* FROM listings l JOIN vehicles v ON v.id = l.vehicle_id

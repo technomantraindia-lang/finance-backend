@@ -1691,7 +1691,21 @@ function safeVehicleForRole(row, req) {
 
 function memoryClientIdsForRequest(req) {
   if (isAdminRequest(req)) return null;
-  if (isCustomerRequest(req)) return req.auth.clientId ? new Set([req.auth.clientId]) : new Set();
+  if (isCustomerRequest(req)) {
+    const expectedClientId = String(req.auth.userId || "").startsWith("u-")
+      ? `c-${String(req.auth.userId).slice(2)}`
+      : "";
+    const email = String(req.auth.email || "").trim().toLowerCase();
+    const name = String(req.auth.name || "").trim().toLowerCase();
+    return new Set(memoryClients
+      .filter((client) =>
+        (req.auth.clientId && client.id === req.auth.clientId)
+        || (expectedClientId && client.id === expectedClientId)
+        || (email && String(client.email || "").trim().toLowerCase() === email)
+        || (name && String(client.name || "").trim().toLowerCase() === name)
+      )
+      .map((client) => client.id));
+  }
   return new Set(memoryClients
     .filter((client) => client.caller_id === req.auth.userId || memoryDues.some((task) => task.client_id === client.id && task.caller_id === req.auth.userId))
     .map((client) => client.id));
@@ -1699,7 +1713,22 @@ function memoryClientIdsForRequest(req) {
 
 async function mysqlClientIdsForRequest(req) {
   if (isAdminRequest(req)) return null;
-  if (isCustomerRequest(req)) return req.auth.clientId ? [req.auth.clientId] : [];
+  if (isCustomerRequest(req)) {
+    const expectedClientId = String(req.auth.userId || "").startsWith("u-")
+      ? `c-${String(req.auth.userId).slice(2)}`
+      : "";
+    const email = String(req.auth.email || "").trim().toLowerCase();
+    const name = String(req.auth.name || "").trim().toLowerCase();
+    const candidates = [req.auth.clientId, expectedClientId].filter(Boolean);
+    const identityClauses = ["LOWER(TRIM(email)) = ?", "LOWER(TRIM(name)) = LOWER(TRIM(?))"];
+    const params = [email, name];
+    if (candidates.length) {
+      identityClauses.unshift(`id IN (${candidates.map(() => "?").join(",")})`);
+      params.unshift(...candidates);
+    }
+    const [rows] = await pool.query(`SELECT id FROM clients WHERE ${identityClauses.join(" OR ")}`, params);
+    return rows.map((row) => row.id);
+  }
   const [rows] = await pool.query(
     `SELECT id FROM clients
      WHERE caller_id = ?

@@ -1745,7 +1745,10 @@ function sqlScope(ids, column) {
 
 async function canAccessClientId(req, clientId) {
   if (isAdminRequest(req)) return true;
-  if (isCustomerRequest(req)) return Boolean(clientId && req.auth.clientId === clientId);
+  if (isCustomerRequest(req)) {
+    const allowed = dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)];
+    return Boolean(clientId && allowed.includes(clientId));
+  }
   if (!dbAvailable) return memoryClientIdsForRequest(req).has(clientId);
   const [rows] = await pool.query(
     `SELECT id FROM clients
@@ -2213,7 +2216,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   }
   const lowerEmail = String(email).trim().toLowerCase();
   const id = `u-${Date.now()}`;
-  const clientId = `c-${id.slice(2)}`;
+  let clientId = `c-${id.slice(2)}`;
 
   await pingDb();
   if (!dbAvailable) {
@@ -2222,8 +2225,16 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     }
     memoryUsers.push({ id, name, role: userRole, email: lowerEmail, password_hash: password });
     if (userRole !== "Caller") {
-      const client = { id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password };
-      memoryClients.push(client);
+      const existingClient = memoryClients.find((client) =>
+        String(client.email || "").trim().toLowerCase() === lowerEmail
+        || String(client.name || "").trim().toLowerCase() === name.trim().toLowerCase()
+      );
+      if (existingClient) {
+        clientId = existingClient.id;
+        existingClient.email = lowerEmail;
+      } else {
+        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password });
+      }
     }
     return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "memory" });
   }
@@ -2237,10 +2248,22 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       [id, name, userRole, lowerEmail, password]
     );
     if (userRole !== "Caller") {
-      await conn.query(
-        "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
-        [clientId, name, lowerEmail]
+      const [existingClients] = await conn.query(
+        `SELECT id FROM clients
+         WHERE LOWER(TRIM(email)) = ? OR LOWER(TRIM(name)) = LOWER(TRIM(?))
+         ORDER BY CASE WHEN LOWER(TRIM(email)) = ? THEN 0 ELSE 1 END, created_at DESC
+         LIMIT 1`,
+        [lowerEmail, name, lowerEmail]
       );
+      if (existingClients.length) {
+        clientId = existingClients[0].id;
+        await conn.query("UPDATE clients SET email = ? WHERE id = ?", [lowerEmail, clientId]);
+      } else {
+        await conn.query(
+          "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
+          [clientId, name, lowerEmail]
+        );
+      }
     }
     await conn.commit();
   } catch (err) {
@@ -2477,17 +2500,23 @@ app.post("/api/login", asyncHandler(async (req, res) => {
       ? `c-${String(user.id).slice(2)}`
       : "";
     const [clientRows] = await pool.query(
-      `SELECT id FROM clients
+      `SELECT id,
+          (EXISTS (SELECT 1 FROM vehicles v WHERE v.client_id = clients.id)
+           OR EXISTS (SELECT 1 FROM due_tasks d WHERE d.client_id = clients.id)) AS has_records
+       FROM clients
        WHERE id = ?
           OR LOWER(TRIM(email)) = ?
           OR LOWER(TRIM(name)) = LOWER(TRIM(?))
        ORDER BY CASE
-         WHEN LOWER(TRIM(email)) = ? THEN 0
-         WHEN id = ? THEN 1
-         ELSE 2
+         WHEN LOWER(TRIM(email)) = ? AND has_records THEN 0
+         WHEN id = ? AND has_records THEN 1
+         WHEN LOWER(TRIM(name)) = LOWER(TRIM(?)) AND has_records THEN 2
+         WHEN LOWER(TRIM(email)) = ? THEN 3
+         WHEN id = ? THEN 4
+         ELSE 5
        END, created_at DESC
        LIMIT 1`,
-      [expectedClientId, lowerEmail, user.name, lowerEmail, expectedClientId]
+      [expectedClientId, lowerEmail, user.name, lowerEmail, expectedClientId, user.name, lowerEmail, expectedClientId]
     );
     clientId = clientRows[0]?.id || null;
   }

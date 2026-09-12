@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS vehicles (
   insurance_expiry DATE,
   permit_expiry DATE,
   status VARCHAR(32) DEFAULT 'Active',
+  sold_date DATE NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
 );

@@ -385,7 +385,8 @@ function normalizeVehicle(row) {
     combination_id: String(row.combinationId || row.combination_id || "").trim(),
     insurance_expiry: toMysqlDate(row.insuranceExpiry || row.insurance_expiry),
     permit_expiry: toMysqlDate(row.permitExpiry || row.permit_expiry),
-    status: row.status || "Active"
+    status: row.status || "Active",
+    sold_date: toMysqlDate(row.soldDate || row.sold_date)
   };
 }
 
@@ -1320,7 +1321,8 @@ async function ensureVehicleFinanceColumns(conn = null) {
     ["puc_expiry", "DATE NULL"],
     ["fitness_expiry", "DATE NULL"],
     ["compliance_history_json", "LONGTEXT NULL"],
-    ["combination_id", "VARCHAR(80) NULL"]
+    ["combination_id", "VARCHAR(80) NULL"],
+    ["sold_date", "DATE NULL"]
   ];
   for (const [name, definition] of columns) {
     try {
@@ -1768,6 +1770,15 @@ async function syncScopedData(req, payload) {
     const ownVerificationItems = payload.verificationItems || [];
     if (!dbAvailable) {
       const ownVehicleIds = new Set(memoryVehicles.filter((vehicle) => allowed.has(vehicle.client_id)).map((vehicle) => vehicle.id));
+      for (const vehicle of payload.vehicles || []) {
+        if (ownVehicleIds.has(vehicle.id)) {
+          const current = memoryVehicles.find((item) => item.id === vehicle.id);
+          if (current) {
+            current.status = vehicle.status;
+            current.sold_date = vehicle.sold_date || null;
+          }
+        }
+      }
       const ownTaskIds = new Set(memoryDues.filter((task) => allowed.has(task.client_id)).map((task) => task.id));
       for (const task of payload.dueTasks || []) {
         const current = memoryDues.find((item) => item.id === task.id && ownTaskIds.has(item.id));
@@ -1800,6 +1811,11 @@ async function syncScopedData(req, payload) {
       const clientScope = sqlScope([...allowed], "client_id");
       const [vehicleRows] = await conn.query(`SELECT id FROM vehicles WHERE ${clientScope.clause}`, clientScope.params);
       const ownVehicleIds = new Set(vehicleRows.map((row) => row.id));
+      for (const vehicle of payload.vehicles || []) {
+        if (ownVehicleIds.has(vehicle.id) && ["Active", "Listed", "Sold"].includes(vehicle.status)) {
+          await conn.query("UPDATE vehicles SET status = ?, sold_date = ? WHERE id = ? AND client_id = ?", [vehicle.status, vehicle.sold_date || null, vehicle.id, req.auth.clientId]);
+        }
+      }
       const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
       for (const task of payload.dueTasks || []) {
         if (task.status === "Proof Pending") {
@@ -3065,7 +3081,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const saleClosings = Array.isArray(req.body?.saleClosings) ? req.body.saleClosings.map(normalizeSaleClosing).filter((row) => row.id && row.listing_id && row.vehicle_id && row.client_id) : null;
   const marketplaceThreads = null; // Live conversations are owned by the chat endpoints.
   if (!isAdminRequest(req)) {
-    const scoped = await syncScopedData(req, { incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
+    const scoped = await syncScopedData(req, { vehicles, incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
     return res.json({ ok: true, mode: dbAvailable ? "mysql-scoped" : "memory-scoped", synced: scoped });
   }
   const dueTasks = appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs);
@@ -3127,12 +3143,13 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     for (const vehicle of vehicles) {
       await conn.query(
         `REPLACE INTO vehicles
-          (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, combination_id, insurance_expiry, permit_expiry, status)
+         (id, client_id, type, reg_no, make, model, year, km, principal, overdue, penalty, foreclosure, loan_id, loan_account, financier, loan_amount, emi_amount, interest_rate, tenure, paid_emi, emi_start, emi_end, emi_schedule_json, emi_history_json, insurance_company, insurance_policy_no, insurance_start, insurance_history_json, permit_no, permit_issue, permit_type, national_permit_expiry, puc_no, puc_expiry, fitness_expiry, compliance_history_json, combination_id, insurance_expiry, permit_expiry, status, sold_date)
          VALUES (
            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           , ?
          )`,
         [
           vehicle.id,
@@ -3174,7 +3191,8 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
           vehicle.combination_id,
           vehicle.insurance_expiry,
           vehicle.permit_expiry,
-          vehicle.status
+          vehicle.status,
+          vehicle.sold_date
         ]
       );
     }

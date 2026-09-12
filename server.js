@@ -354,7 +354,7 @@ function normalizeVehicle(row) {
     model: row.model || "",
     year: Number(row.year || 0),
     km: Number(row.km || 0),
-    principal: Number(row.principal || 0),
+    principal: Number(row.closingPrincipal ?? row.closing_principal ?? row.principal ?? 0),
     overdue: Number(row.overdue || 0),
     penalty: Number(row.penalty || 0),
     foreclosure: Number(row.foreclosure || 0),

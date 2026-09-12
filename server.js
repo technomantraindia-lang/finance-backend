@@ -1787,7 +1787,10 @@ async function syncScopedData(req, payload) {
       const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
       for (const listing of ownListings) {
         const current = memoryListings.find((item) => item.id === listing.id);
-        const protectedStatus = ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
+        const linkedVehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
+        const protectedStatus = linkedVehicle?.status === "Sold"
+          ? "Sold"
+          : ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
         upsertMemoryItem(memoryListings, { ...listing, status: protectedStatus });
       }
       const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
@@ -1823,10 +1826,12 @@ async function syncScopedData(req, payload) {
         }
       }
       for (const listing of ownListings) {
+        const [linkedVehicleRows] = await conn.query("SELECT status FROM vehicles WHERE id = ? AND client_id = ? LIMIT 1", [listing.vehicle_id, req.auth.clientId]);
+        const linkedVehicleStatus = linkedVehicleRows[0]?.status;
         await conn.query(
           `INSERT INTO listings
             (id, vehicle_id, title, price, location, status, condition_note, photos_json)
-           VALUES (?, ?, ?, ?, ?, 'Submitted', ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE
              vehicle_id = VALUES(vehicle_id),
              title = VALUES(title),
@@ -1834,8 +1839,8 @@ async function syncScopedData(req, payload) {
              location = VALUES(location),
              condition_note = VALUES(condition_note),
              photos_json = VALUES(photos_json),
-             status = CASE WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END`,
-          [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.condition_note, JSON.stringify(listing.photos)]
+             status = CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END`,
+          [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, linkedVehicleStatus === "Sold" ? "Sold" : listing.status, listing.condition_note, JSON.stringify(listing.photos)]
         );
       }
       const [taskRows] = await conn.query("SELECT id FROM due_tasks WHERE client_id = ?", [req.auth.clientId]);

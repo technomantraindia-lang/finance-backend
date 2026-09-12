@@ -1766,6 +1766,7 @@ async function syncScopedData(req, payload) {
   if (isCustomerRequest(req)) {
     const allowed = new Set([req.auth.clientId].filter(Boolean));
     const ownDocuments = (payload.documents || []).filter((item) => allowed.has(item.client_id));
+    const ownSaleClosings = (payload.saleClosings || []).filter((item) => allowed.has(item.client_id));
     const ownThreads = (payload.marketplaceThreads || []).filter((item) => allowed.has(item.buyer_client_id) || allowed.has(item.seller_client_id));
     const ownVerificationItems = payload.verificationItems || [];
     if (!dbAvailable) {
@@ -1802,8 +1803,12 @@ async function syncScopedData(req, payload) {
         if (allowed.has(memoryDocuments[index].client_id)) memoryDocuments.splice(index, 1);
       }
       memoryDocuments.push(...ownDocuments);
+      for (let index = memorySaleClosings.length - 1; index >= 0; index -= 1) {
+        if (allowed.has(memorySaleClosings[index].client_id)) memorySaleClosings.splice(index, 1);
+      }
+      memorySaleClosings.push(...ownSaleClosings);
 
-      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: ownDocuments.length, verificationItems: verifiedItems.length, marketplaceThreads: ownThreads.length };
+      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: ownDocuments.length, verificationItems: verifiedItems.length, saleClosings: ownSaleClosings.length, marketplaceThreads: ownThreads.length };
     }
     const conn = await pool.getConnection();
     try {
@@ -1866,9 +1871,17 @@ async function syncScopedData(req, payload) {
       }
       const documentIds = ownDocuments.map((item) => item.id);
       await conn.query(`DELETE FROM documents WHERE ${clientScope.clause}${documentIds.length ? ` AND id NOT IN (${documentIds.map(() => "?").join(",")})` : ""}`, [...clientScope.params, ...documentIds]);
+      for (const closing of ownSaleClosings) {
+        await conn.query(
+          `REPLACE INTO sale_closings
+            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, status, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.status, closing.updated_at]
+        );
+      }
       const threadIds = []; // General customer sync must not replace or delete chat history.
       await conn.commit();
-      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: documentIds.length, verificationItems: verifiedItems.length, marketplaceThreads: threadIds.length };
+      return { dueTasks: (payload.dueTasks || []).filter((task) => ownTaskIds.has(task.id) && task.status === "Proof Pending").length, listings: ownListings.length, documents: documentIds.length, verificationItems: verifiedItems.length, saleClosings: ownSaleClosings.length, marketplaceThreads: threadIds.length };
     } catch (error) {
       await conn.rollback();
       throw error;
@@ -3086,7 +3099,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
   const saleClosings = Array.isArray(req.body?.saleClosings) ? req.body.saleClosings.map(normalizeSaleClosing).filter((row) => row.id && row.listing_id && row.vehicle_id && row.client_id) : null;
   const marketplaceThreads = null; // Live conversations are owned by the chat endpoints.
   if (!isAdminRequest(req)) {
-    const scoped = await syncScopedData(req, { vehicles, incomingDueTasks, listings, callerActivities, documents, verificationItems, marketplaceThreads });
+    const scoped = await syncScopedData(req, { vehicles, incomingDueTasks, listings, callerActivities, documents, verificationItems, saleClosings, marketplaceThreads });
     return res.json({ ok: true, mode: dbAvailable ? "mysql-scoped" : "memory-scoped", synced: scoped });
   }
   const dueTasks = appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs);

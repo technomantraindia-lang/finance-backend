@@ -9,6 +9,8 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || "").trim();
+const ANTHROPIC_MODEL = String(process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6").trim();
 const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
 const DUE_MONITOR_ENABLED = process.env.DUE_MONITOR_ENABLED !== "false";
 const DUE_MONITOR_INTERVAL_HOURS = Math.max(1, Number(process.env.DUE_MONITOR_INTERVAL_HOURS || 24));
@@ -1627,6 +1629,133 @@ async function ensureClientsEmailColumn(conn = null) {
 const asyncHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
+function parseJsonObjectFromModelText(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizeAiNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const normalized = String(value).replace(/[₹,\s]/g, "").replace(/\(([^)]+)\)/, "-$1");
+  const number = Number(normalized);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function normalizeAiPdfFields(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const schedule = Array.isArray(source.emiSchedule) ? source.emiSchedule.map((row) => ({
+    installment: normalizeAiNumber(row?.installment),
+    dueDate: String(row?.dueDate || "").trim(),
+    openingPrincipal: normalizeAiNumber(row?.openingPrincipal),
+    amount: normalizeAiNumber(row?.amount ?? row?.installmentAmount),
+    principal: normalizeAiNumber(row?.principal ?? row?.principalPaid),
+    interest: normalizeAiNumber(row?.interest),
+    closingPrincipal: normalizeAiNumber(row?.closingPrincipal),
+    status: String(row?.status || "").trim()
+  })).filter((row) => row.installment && row.dueDate && row.amount !== null) : [];
+  return {
+    agreementNumber: String(source.agreementNumber || source.loanAccount || "").trim(),
+    registrationNumber: String(source.registrationNumber || source.regNo || "").trim(),
+    customerName: String(source.customerName || source.owner || "").trim(),
+    financier: String(source.financier || "").trim(),
+    manufacturer: String(source.manufacturer || "").trim(),
+    model: String(source.model || "").trim(),
+    loanAmount: normalizeAiNumber(source.loanAmount),
+    emiAmount: normalizeAiNumber(source.emiAmount),
+    tenureMonths: normalizeAiNumber(source.tenureMonths ?? source.tenure),
+    paidEmi: normalizeAiNumber(source.paidEmi),
+    interestRate: normalizeAiNumber(source.interestRate),
+    emiStartDate: String(source.emiStartDate || source.emiStart || "").trim(),
+    emiEndDate: String(source.emiEndDate || source.emiEnd || "").trim(),
+    bankClosingPrincipal: normalizeAiNumber(source.bankClosingPrincipal ?? source.closingPrincipal),
+    emiSchedule: schedule,
+    warnings: Array.isArray(source.warnings) ? source.warnings.map((item) => String(item)).filter(Boolean).slice(0, 10) : []
+  };
+}
+
+async function extractPdfWithAnthropic(pdfBase64, fileName = "document.pdf") {
+  if (!ANTHROPIC_API_KEY) {
+    const error = new Error("ANTHROPIC_API_KEY is not configured on the backend.");
+    error.status = 503;
+    throw error;
+  }
+  const prompt = `You are a meticulous bank-finance PDF extraction engine. Read every page visually and from the text layer. Extract only values that are actually present; never guess or calculate a missing amount. This document may be a repayment schedule, loan statement, foreclosure statement, or bank finance PDF.
+
+Return ONLY one valid JSON object, with no markdown and no explanation, using exactly these keys:
+{
+  "agreementNumber": "",
+  "registrationNumber": "",
+  "customerName": "",
+  "financier": "",
+  "manufacturer": "",
+  "model": "",
+  "loanAmount": null,
+  "emiAmount": null,
+  "tenureMonths": null,
+  "paidEmi": null,
+  "interestRate": null,
+  "emiStartDate": "",
+  "emiEndDate": "",
+  "bankClosingPrincipal": null,
+  "emiSchedule": [],
+  "warnings": []
+}
+
+"loanAmount", "emiAmount", "bankClosingPrincipal", schedule amounts and "interestRate" must be JSON numbers without currency symbols or commas, or null when unreadable. Use the exact digits from the PDF. Dates must be DD/MM/YYYY when present. Each schedule row must use: installment, dueDate, openingPrincipal, amount, principal, interest, closingPrincipal, status. Do not treat phone numbers, agreement numbers, dates, page numbers, or row numbers as money. If multiple candidate amounts exist, choose only the one whose label and table column clearly identify it; otherwise use null and add a warning. File name: ${String(fileName).slice(0, 160)}`;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 12000,
+      temperature: 0,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "base64", media_type: "application/pdf", data: pdfBase64 }
+          },
+          { type: "text", text: prompt }
+        ]
+      }]
+    })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(result?.error?.message || `Anthropic request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
+  }
+  const modelText = Array.isArray(result.content)
+    ? result.content.filter((block) => block?.type === "text").map((block) => block.text).join("\n")
+    : "";
+  const parsed = parseJsonObjectFromModelText(modelText);
+  if (!parsed) {
+    const error = new Error("Anthropic returned an unreadable extraction result.");
+    error.status = 502;
+    throw error;
+  }
+  return normalizeAiPdfFields(parsed);
+}
+
 function issueSession(user, clientId = null) {
   const payload = {
     userId: user.id,
@@ -1935,7 +2064,19 @@ app.use("/api", asyncHandler(async (req, res, next) => {
   authenticateRequest(req, res, next);
 }));
 
+app.post("/api/pdf-ai-extract", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const mimeType = String(req.body?.mimeType || "application/pdf").toLowerCase();
+  if (mimeType !== "application/pdf") return res.status(400).json({ error: "Only PDF files are supported for bank PDF AI extraction." });
+  const rawBase64 = String(req.body?.pdfBase64 || "").replace(/^data:application\/pdf;base64,/i, "").replace(/\s+/g, "");
+  if (!rawBase64 || !/^[a-z0-9+/]+=*$/i.test(rawBase64)) return res.status(400).json({ error: "A valid base64 PDF is required." });
+  if (Buffer.byteLength(rawBase64, "base64") > 8 * 1024 * 1024) return res.status(413).json({ error: "PDF must be smaller than 8 MB." });
+  const fields = await extractPdfWithAnthropic(rawBase64, req.body?.fileName || "document.pdf");
+  res.json({ ok: true, provider: "anthropic", model: ANTHROPIC_MODEL, fields });
+}));
+
 app.use("/api", asyncHandler(async (req, res, next) => {
+  if (req.path === "/health" || req.path === "/login" || req.path === "/pdf-ai-extract") return next();
   await pingDb();
   if (REQUIRE_DATABASE && !dbAvailable) {
     return res.status(503).json({

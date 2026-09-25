@@ -9,8 +9,11 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const ANTHROPIC_API_KEY = String(process.env.ANTHROPIC_API_KEY || "").trim();
-const ANTHROPIC_MODEL = String(process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6").trim();
+const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || "").trim();
+const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || "stealth/space-bunny-alpha").trim();
+const OPENROUTER_PDF_ENGINE = String(process.env.OPENROUTER_PDF_ENGINE || "pdf-text").trim();
+const OPENROUTER_HTTP_REFERER = String(process.env.OPENROUTER_HTTP_REFERER || "https://erp.aakashfinance.com").trim();
+const OPENROUTER_APP_NAME = String(process.env.OPENROUTER_APP_NAME || "Kuber Finance").trim();
 const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
 const DUE_MONITOR_ENABLED = process.env.DUE_MONITOR_ENABLED !== "false";
 const DUE_MONITOR_INTERVAL_HOURS = Math.max(1, Number(process.env.DUE_MONITOR_INTERVAL_HOURS || 24));
@@ -1685,9 +1688,9 @@ function normalizeAiPdfFields(value = {}) {
   };
 }
 
-async function extractPdfWithAnthropic(pdfBase64, fileName = "document.pdf") {
-  if (!ANTHROPIC_API_KEY) {
-    const error = new Error("ANTHROPIC_API_KEY is not configured on the backend.");
+async function extractPdfWithOpenRouter(pdfBase64, fileName = "document.pdf") {
+  if (!OPENROUTER_API_KEY) {
+    const error = new Error("OPENROUTER_API_KEY is not configured on the backend.");
     error.status = 503;
     throw error;
   }
@@ -1715,41 +1718,49 @@ Return ONLY one valid JSON object, with no markdown and no explanation, using ex
 
 "loanAmount", "emiAmount", "bankClosingPrincipal", schedule amounts and "interestRate" must be JSON numbers without currency symbols or commas, or null when unreadable. Use the exact digits from the PDF. Dates must be DD/MM/YYYY when present. Each schedule row must use: installment, dueDate, openingPrincipal, amount, principal, interest, closingPrincipal, status. Do not treat phone numbers, agreement numbers, dates, page numbers, or row numbers as money. If multiple candidate amounts exist, choose only the one whose label and table column clearly identify it; otherwise use null and add a warning. File name: ${String(fileName).slice(0, 160)}`;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01"
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      ...(OPENROUTER_HTTP_REFERER ? { "HTTP-Referer": OPENROUTER_HTTP_REFERER } : {}),
+      ...(OPENROUTER_APP_NAME ? { "X-OpenRouter-Title": OPENROUTER_APP_NAME } : {})
     },
     body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
+      model: OPENROUTER_MODEL,
       max_tokens: 12000,
       temperature: 0,
       messages: [{
         role: "user",
         content: [
+          { type: "text", text: prompt },
           {
-            type: "document",
-            source: { type: "base64", media_type: "application/pdf", data: pdfBase64 }
-          },
-          { type: "text", text: prompt }
+            type: "file",
+            file: {
+              filename: String(fileName).slice(0, 160) || "document.pdf",
+              file_data: `data:application/pdf;base64,${pdfBase64}`
+            }
+          }
         ]
-      }]
+      }],
+      plugins: [{ id: "file-parser", pdf: { engine: OPENROUTER_PDF_ENGINE } }]
     })
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(result?.error?.message || `Anthropic request failed (${response.status}).`);
+    const error = new Error(result?.error?.message || `OpenRouter request failed (${response.status}).`);
     error.status = response.status;
     throw error;
   }
-  const modelText = Array.isArray(result.content)
-    ? result.content.filter((block) => block?.type === "text").map((block) => block.text).join("\n")
-    : "";
+  const content = result?.choices?.[0]?.message?.content;
+  const modelText = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((block) => typeof block === "string" ? block : block?.text || "").join("\n")
+      : "";
   const parsed = parseJsonObjectFromModelText(modelText);
   if (!parsed) {
-    const error = new Error("Anthropic returned an unreadable extraction result.");
+    const error = new Error("OpenRouter returned an unreadable extraction result.");
     error.status = 502;
     throw error;
   }
@@ -2071,8 +2082,8 @@ app.post("/api/pdf-ai-extract", asyncHandler(async (req, res) => {
   const rawBase64 = String(req.body?.pdfBase64 || "").replace(/^data:application\/pdf;base64,/i, "").replace(/\s+/g, "");
   if (!rawBase64 || !/^[a-z0-9+/]+=*$/i.test(rawBase64)) return res.status(400).json({ error: "A valid base64 PDF is required." });
   if (Buffer.byteLength(rawBase64, "base64") > 8 * 1024 * 1024) return res.status(413).json({ error: "PDF must be smaller than 8 MB." });
-  const fields = await extractPdfWithAnthropic(rawBase64, req.body?.fileName || "document.pdf");
-  res.json({ ok: true, provider: "anthropic", model: ANTHROPIC_MODEL, fields });
+  const fields = await extractPdfWithOpenRouter(rawBase64, req.body?.fileName || "document.pdf");
+  res.json({ ok: true, provider: "openrouter", model: OPENROUTER_MODEL, fields });
 }));
 
 app.use("/api", asyncHandler(async (req, res, next) => {

@@ -5,13 +5,16 @@ const crypto = require("crypto");
 const path = require("path");
 const { mountMarketplaceChat, createMysqlStore } = require("./marketplaceChat");
 require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || "").trim();
-const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || "stealth/space-bunny-alpha").trim();
+const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || "openai/gpt-6-luna").trim();
 const OPENROUTER_PDF_ENGINE = String(process.env.OPENROUTER_PDF_ENGINE || "pdf-text").trim();
+const OPENROUTER_REASONING_EFFORT = String(process.env.OPENROUTER_REASONING_EFFORT || "high").trim();
+const OPENROUTER_TIMEOUT_MS = Math.max(10000, Number(process.env.OPENROUTER_TIMEOUT_MS || 60000));
 const OPENROUTER_HTTP_REFERER = String(process.env.OPENROUTER_HTTP_REFERER || "https://erp.aakashfinance.com").trim();
 const OPENROUTER_APP_NAME = String(process.env.OPENROUTER_APP_NAME || "Kuber Finance").trim();
 const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
@@ -1658,6 +1661,7 @@ function normalizeAiNumber(value) {
 
 function normalizeAiPdfFields(value = {}) {
   const source = value && typeof value === "object" ? value : {};
+  const warnings = Array.isArray(source.warnings) ? source.warnings.map((item) => String(item)).filter(Boolean).slice(0, 10) : [];
   const schedule = Array.isArray(source.emiSchedule) ? source.emiSchedule.map((row) => ({
     installment: normalizeAiNumber(row?.installment),
     dueDate: String(row?.dueDate || "").trim(),
@@ -1668,23 +1672,51 @@ function normalizeAiPdfFields(value = {}) {
     closingPrincipal: normalizeAiNumber(row?.closingPrincipal),
     status: String(row?.status || "").trim()
   })).filter((row) => row.installment && row.dueDate && row.amount !== null) : [];
+  const validationWarnings = [];
+  schedule.forEach((row) => {
+    if (row.principal !== null && row.interest !== null && Math.abs((row.principal + row.interest) - row.amount) > 1) {
+      validationWarnings.push(`Installment ${row.installment}: printed principal plus interest does not reconcile with the printed installment amount; values were preserved.`);
+    }
+  });
+  const orderedSchedule = [...schedule].sort((left, right) => left.installment - right.installment);
+  for (let index = 1; index < orderedSchedule.length; index += 1) {
+    const previous = orderedSchedule[index - 1];
+    const current = orderedSchedule[index];
+    if (previous.closingPrincipal !== null && current.principal !== null && current.closingPrincipal !== null &&
+      Math.abs((previous.closingPrincipal - current.principal) - current.closingPrincipal) > 1) {
+      validationWarnings.push(`Installments ${previous.installment}-${current.installment}: printed principal and outstanding balance do not reconcile; values were preserved.`);
+    }
+  }
+  const paidEmi = normalizeAiNumber(source.paidEmi);
+  const paidRow = paidEmi !== null
+    ? schedule.find((row) => row.installment === paidEmi && row.closingPrincipal !== null)
+    : null;
+  const sourceBankClosing = normalizeAiNumber(source.bankClosingPrincipal ?? source.closingPrincipal);
+  const lastVisibleRow = orderedSchedule[orderedSchedule.length - 1];
+  const scheduleIncomplete = /last\s+visible|last\s+scheduled|schedule\s+includes\s+only|schedule\s+incomplete|installments?\s+\d+.*(?:although|despite|not\s+present)/i.test(warnings.join(" "));
+  const bankClosingPrincipal = paidRow?.closingPrincipal ?? (
+    scheduleIncomplete && sourceBankClosing !== null && lastVisibleRow?.closingPrincipal === sourceBankClosing
+      ? null
+      : sourceBankClosing
+  );
   return {
-    agreementNumber: String(source.agreementNumber || source.loanAccount || "").trim(),
+    agreementNumber: String(source.agreementNumber || source.accountNumber || source.loanAccount || "").trim(),
     registrationNumber: String(source.registrationNumber || source.regNo || "").trim(),
     customerName: String(source.customerName || source.owner || "").trim(),
     financier: String(source.financier || "").trim(),
     manufacturer: String(source.manufacturer || "").trim(),
     model: String(source.model || "").trim(),
+    loanStatus: String(source.loanStatus || source.status || "").trim(),
     loanAmount: normalizeAiNumber(source.loanAmount),
     emiAmount: normalizeAiNumber(source.emiAmount),
     tenureMonths: normalizeAiNumber(source.tenureMonths ?? source.tenure),
-    paidEmi: normalizeAiNumber(source.paidEmi),
+    paidEmi,
     interestRate: normalizeAiNumber(source.interestRate),
     emiStartDate: String(source.emiStartDate || source.emiStart || "").trim(),
     emiEndDate: String(source.emiEndDate || source.emiEnd || "").trim(),
-    bankClosingPrincipal: normalizeAiNumber(source.bankClosingPrincipal ?? source.closingPrincipal),
+    bankClosingPrincipal,
     emiSchedule: schedule,
-    warnings: Array.isArray(source.warnings) ? source.warnings.map((item) => String(item)).filter(Boolean).slice(0, 10) : []
+    warnings: [...warnings, ...validationWarnings].slice(0, 10)
   };
 }
 
@@ -1694,58 +1726,123 @@ async function extractPdfWithOpenRouter(pdfBase64, fileName = "document.pdf") {
     error.status = 503;
     throw error;
   }
-  const prompt = `You are a meticulous bank-finance PDF extraction engine. Read every page visually and from the text layer. Extract only values that are actually present; never guess or calculate a missing amount. This document may be a repayment schedule, loan statement, foreclosure statement, or bank finance PDF.
+  const prompt = `You are a financial loan repayment schedule extraction engine.
 
-Return ONLY one valid JSON object, with no markdown and no explanation, using exactly these keys:
-{
-  "agreementNumber": "",
-  "registrationNumber": "",
-  "customerName": "",
-  "financier": "",
-  "manufacturer": "",
-  "model": "",
-  "loanAmount": null,
-  "emiAmount": null,
-  "tenureMonths": null,
-  "paidEmi": null,
-  "interestRate": null,
-  "emiStartDate": "",
-  "emiEndDate": "",
-  "bankClosingPrincipal": null,
-  "emiSchedule": [],
-  "warnings": []
-}
+Read the uploaded PDF carefully, including every page, image-based/scanned page, and table. Visually inspect scanned tables. Extract only values that are actually printed in the PDF. Never calculate, guess, infer, or fill a missing financial value. Return ONLY one valid JSON object, with no markdown and no explanation.
 
-"loanAmount", "emiAmount", "bankClosingPrincipal", schedule amounts and "interestRate" must be JSON numbers without currency symbols or commas, or null when unreadable. Use the exact digits from the PDF. Dates must be DD/MM/YYYY when present. Each schedule row must use: installment, dueDate, openingPrincipal, amount, principal, interest, closingPrincipal, status. Do not treat phone numbers, agreement numbers, dates, page numbers, or row numbers as money. If multiple candidate amounts exist, choose only the one whose label and table column clearly identify it; otherwise use null and add a warning. File name: ${String(fileName).slice(0, 160)}`;
+EXTRACTION RULES:
+1. loanAmount: extract only from the printed field labelled Total Loan Sanctioned, Loan Amount, Loan Amt, Finance Amt, Fin Amt, Amount Financed, Total Loan Disbursed, or an equivalent loan-sanction field. Never use Principal, O/S Principal, Closing Principal, Finance Charges, Invoice Amount, Total Payable, or Outstanding Balance.
+2. emiAmount: extract the recurring printed value from Total Installment, EMI, EMI Amount, Installment, or the equivalent table column.
+3. tenureMonths: extract directly from Period in Months, Tenure, Term, or equivalent. Do not calculate from dates or schedule rows.
+4. interestRate: extract directly from Current Int Rate(%), Interest Rate, Rate of Interest, or equivalent.
+5. emiStartDate: use the Repayment Date/Due Date of installment number 1. Do not use a generation date or generic Start Date unless it is explicitly the first EMI due date.
+6. emiEndDate: use an explicitly printed Maturity Date or EMI End Date. Do not infer it from the last visible table row when a maturity date is printed.
+7. paidEmi: return a number only when the PDF explicitly identifies paid, received, cleared, or completed installments. A planned repayment schedule alone does not prove that installments were paid. Otherwise return null.
+8. bankClosingPrincipal: if paidEmi is known and that installment row is visible, use the Outstanding Balance/Closing Principal from the row for the latest paid installment. Never use the final visible schedule row merely because it is the final row shown. If paidEmi is unknown, return null unless a separate, explicitly labelled current closing principal/outstanding balance is printed outside the schedule. Never calculate this field.
+9. emiSchedule: for every visible installment row, preserve row integrity and extract installment, dueDate, amount (Total Installment), principal, interest, closingPrincipal (Outstanding Balance), and status only when payment status is explicitly printed. Never combine cells from different rows. Check principal + interest = amount and previous closingPrincipal - current principal = current closingPrincipal; if printed values do not reconcile, preserve the printed values and add a warning.
+10. For agreementNumber, treat a clearly printed Loan Account No, Account No, Account Number, LAN, Contract No, or Agreement No as the agreementNumber value, even when the PDF calls it Account No instead of Agreement No. Copy the exact printed alphanumeric value. Never replace it with a profile value or filename value. If no such labelled account/agreement field is visible, return an empty string. Never invent agreement number, registration number, customer, financier, manufacturer, model, status, or any financial value. Never assume manufacturer from the filename.
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      ...(OPENROUTER_HTTP_REFERER ? { "HTTP-Referer": OPENROUTER_HTTP_REFERER } : {}),
-      ...(OPENROUTER_APP_NAME ? { "X-OpenRouter-Title": OPENROUTER_APP_NAME } : {})
-    },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL,
-      max_tokens: 12000,
-      temperature: 0,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          {
-            type: "file",
-            file: {
-              filename: String(fileName).slice(0, 160) || "document.pdf",
-              file_data: `data:application/pdf;base64,${pdfBase64}`
+NUMBER NORMALIZATION:
+Rs.26,00,000 => 2600000
+88,244.00 => 88244
+13.51% => 13.51
+2553712.00 => 2553712
+Use JSON numbers without currency symbols, percent signs, or commas. Missing values must be null or empty strings.
+
+The response must match the JSON schema supplied with this request. The schema also includes loanStatus for application compatibility. File name: ${String(fileName).slice(0, 160)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        ...(OPENROUTER_HTTP_REFERER ? { "HTTP-Referer": OPENROUTER_HTTP_REFERER } : {}),
+        ...(OPENROUTER_APP_NAME ? { "X-OpenRouter-Title": OPENROUTER_APP_NAME } : {})
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_MODEL,
+        max_tokens: 12000,
+        temperature: 0,
+        reasoning_effort: OPENROUTER_REASONING_EFFORT,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            {
+              type: "file",
+              file: {
+                filename: String(fileName).slice(0, 160) || "document.pdf",
+                file_data: `data:application/pdf;base64,${pdfBase64}`
+              }
+            }
+          ]
+        }],
+        plugins: [{ id: "file-parser", pdf: { engine: OPENROUTER_PDF_ENGINE } }],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "bank_finance_extraction",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                agreementNumber: { type: "string" },
+                registrationNumber: { type: "string" },
+                customerName: { type: "string" },
+                financier: { type: "string" },
+                manufacturer: { type: "string" },
+                model: { type: "string" },
+              loanStatus: { type: "string" },
+                loanAmount: { type: ["number", "null"] },
+                emiAmount: { type: ["number", "null"] },
+                tenureMonths: { type: ["number", "null"] },
+                paidEmi: { type: ["number", "null"] },
+                interestRate: { type: ["number", "null"] },
+                emiStartDate: { type: "string" },
+                emiEndDate: { type: "string" },
+                bankClosingPrincipal: { type: ["number", "null"] },
+                emiSchedule: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      installment: { type: ["number", "null"] },
+                      dueDate: { type: "string" },
+                      openingPrincipal: { type: ["number", "null"] },
+                      amount: { type: ["number", "null"] },
+                      principal: { type: ["number", "null"] },
+                      interest: { type: ["number", "null"] },
+                      closingPrincipal: { type: ["number", "null"] },
+                      status: { type: "string" }
+                    },
+                    required: ["installment", "dueDate", "openingPrincipal", "amount", "principal", "interest", "closingPrincipal", "status"]
+                  }
+                },
+                warnings: { type: "array", items: { type: "string" } }
+              },
+              required: ["agreementNumber", "registrationNumber", "customerName", "financier", "manufacturer", "model", "loanStatus", "loanAmount", "emiAmount", "tenureMonths", "paidEmi", "interestRate", "emiStartDate", "emiEndDate", "bankClosingPrincipal", "emiSchedule", "warnings"]
             }
           }
-        ]
-      }],
-      plugins: [{ id: "file-parser", pdf: { engine: OPENROUTER_PDF_ENGINE } }]
-    })
-  });
+        }
+      })
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`OpenRouter timed out after ${Math.round(OPENROUTER_TIMEOUT_MS / 1000)} seconds.`);
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(result?.error?.message || `OpenRouter request failed (${response.status}).`);
@@ -2100,6 +2197,9 @@ app.use("/api", asyncHandler(async (req, res, next) => {
         database: dbSettings.database,
         ssl: process.env.DB_SSL === "true"
       },
+      openrouterConfigured: Boolean(OPENROUTER_API_KEY),
+      openrouterModel: OPENROUTER_MODEL,
+      openrouterPdfEngine: OPENROUTER_PDF_ENGINE,
       detail: lastDbError
     });
   }
@@ -2124,11 +2224,14 @@ app.get("/api/health", asyncHandler(async (req, res) => {
         database: dbSettings.database,
         ssl: process.env.DB_SSL === "true"
       },
+      openrouterConfigured: Boolean(OPENROUTER_API_KEY),
+      openrouterModel: OPENROUTER_MODEL,
+      openrouterPdfEngine: OPENROUTER_PDF_ENGINE,
       detail: lastDbError
     });
   }
   const now = await pool.query("SELECT NOW() AS now");
-  res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now, dueMonitor: lastDueMonitorResult, callerAssignment: lastCallerAssignmentResult });
+  res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now, openrouterConfigured: Boolean(OPENROUTER_API_KEY), openrouterModel: OPENROUTER_MODEL, openrouterPdfEngine: OPENROUTER_PDF_ENGINE, dueMonitor: lastDueMonitorResult, callerAssignment: lastCallerAssignmentResult });
 }));
 
 app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {

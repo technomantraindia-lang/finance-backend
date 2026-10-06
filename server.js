@@ -121,6 +121,9 @@ const pool = mysql.createPool({
   password: databaseConfig ? decodeURIComponent(databaseConfig.password) : (process.env.DB_PASSWORD || ""),
   database: dbSettings.database,
   waitForConnections: true,
+  // DATE columns are calendar dates, not instants. JSON serialization of a
+  // local-midnight Date otherwise moves Indian dates to the previous UTC day.
+  dateStrings: ["DATE"],
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
   queueLimit: 0,
   ssl: dbSettings.ssl

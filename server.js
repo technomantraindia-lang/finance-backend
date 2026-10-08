@@ -747,7 +747,16 @@ function replaceMemoryCollection(collection, rows) {
 
 function parseDueDate(value) {
   if (!value) return null;
-  const date = value instanceof Date ? value : new Date(String(value));
+  if (value instanceof Date) {
+    const date = new Date(value.getTime());
+    if (Number.isNaN(date.getTime())) return null;
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }
+  // Existing imported records can contain Indian dates such as 15-09-2021.
+  // Normalize all supported date formats before comparing with today's date.
+  const normalized = toMysqlDate(value);
+  const date = normalized ? new Date(`${normalized}T00:00:00`) : new Date(String(value));
   if (Number.isNaN(date.getTime())) return null;
   date.setHours(0, 0, 0, 0);
   return date;

@@ -930,8 +930,40 @@ async function runMemoryDueDateMonitoring(source = "manual") {
     created += 1;
   }
 
+  replaceMemoryCollection(memoryDues, deduplicateDueTasks(memoryDues));
+  const today = parseDueDate(new Date());
+  const autoPaidByVehicle = new Map();
   for (const task of memoryDues) {
-    if (["Closed", "Proof Pending", "Verification Pending"].includes(task.status)) continue;
+    if (task.type !== "EMI" || ["Closed", "Proof Pending", "Verification Pending", "Auto Paid", "Paid"].includes(task.status)) continue;
+    const dueDate = parseDueDate(task.due_date);
+    if (!today || !dueDate || dueDate > today) continue;
+    task.status = "Auto Paid";
+    task.priority = "Low";
+    autoPaidByVehicle.set(task.vehicle_id, (autoPaidByVehicle.get(task.vehicle_id) || 0) + 1);
+    updated += 1;
+  }
+  for (const [vehicleId, autoPaidCount] of autoPaidByVehicle) {
+    const vehicle = memoryVehicles.find((item) => item.id === vehicleId);
+    if (!vehicle) continue;
+    let schedule = vehicle.emi_schedule_json || [];
+    if (typeof schedule === "string") {
+      try { schedule = JSON.parse(schedule || "[]"); } catch { schedule = []; }
+    }
+    let schedulePaidCount = 0;
+    if (Array.isArray(schedule)) {
+      schedule = schedule.map((entry) => {
+        const entryDate = parseDueDate(entry?.dueDate);
+        if (!entryDate || entryDate > today || entry.status === "Paid") return entry;
+        schedulePaidCount += 1;
+        return { ...entry, status: "Paid", autoPaid: true, paidAt: entry.paidAt || formatDateOnly(entryDate) };
+      });
+    }
+    vehicle.emi_schedule_json = JSON.stringify(schedule);
+    vehicle.paid_emi = Math.min(Number(vehicle.tenure || 0) || 360, Math.max(Number(vehicle.paid_emi || 0) + autoPaidCount, schedulePaidCount));
+  }
+
+  for (const task of memoryDues) {
+    if (["Closed", "Proof Pending", "Verification Pending", "Auto Paid", "Paid"].includes(task.status)) continue;
     const days = daysUntil(task.due_date);
     if (days === null) continue;
     const nextStatus = dueStatusForDays(days);
@@ -957,7 +989,7 @@ async function runMysqlDueDateMonitoring(source = "manual") {
      LEFT JOIN clients c ON c.id = v.client_id`
   );
   const [imports] = await pool.query("SELECT * FROM client_imports");
-  const [existingDueRows] = await pool.query("SELECT id, due_date, status, priority FROM due_tasks");
+  const [existingDueRows] = await pool.query("SELECT id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority FROM due_tasks");
   const existingIds = new Set(existingDueRows.map((task) => task.id));
   const existingKeys = new Set(existingDueRows.map(dueTaskKey));
   const vehiclesByReg = new Map(vehicles.map((vehicle) => [String(vehicle.reg_no || "").replace(/\W/g, "").toLowerCase(), vehicle]));
@@ -1002,8 +1034,57 @@ async function runMysqlDueDateMonitoring(source = "manual") {
     created += 1;
   }
 
+  // Automatically count EMI installments once their due date arrives. Keep
+  // the task as `Auto Paid` (instead of Closed) so the customer can still
+  // upload payment proof and Admin can verify it later.
+  const today = parseDueDate(new Date());
+  const allDueRows = deduplicateDueTasks([...existingDueRows, ...candidates.filter(Boolean)]);
+  const vehiclesById = new Map(vehicles.map((vehicle) => [vehicle.id, vehicle]));
+  const autoPaidByVehicle = new Map();
+  for (const task of allDueRows) {
+    if (task.type !== "EMI" || ["Closed", "Proof Pending", "Verification Pending", "Auto Paid", "Paid"].includes(task.status)) continue;
+    const dueDate = parseDueDate(task.due_date);
+    if (!today || !dueDate || dueDate > today) continue;
+    await pool.query("UPDATE due_tasks SET status = 'Auto Paid', priority = 'Low' WHERE id = ? AND status IN ('Due', 'Overdue')", [task.id]);
+    const vehicle = vehiclesById.get(task.vehicle_id);
+    if (vehicle) autoPaidByVehicle.set(vehicle.id, (autoPaidByVehicle.get(vehicle.id) || 0) + 1);
+    updated += 1;
+  }
+  for (const [vehicleId, autoPaidCount] of autoPaidByVehicle) {
+    const vehicle = vehiclesById.get(vehicleId);
+    if (!vehicle) continue;
+    let schedule = vehicle.emi_schedule_json || [];
+    if (typeof schedule === "string") {
+      try { schedule = JSON.parse(schedule || "[]"); } catch { schedule = []; }
+    }
+    let history = vehicle.emi_history_json || [];
+    if (typeof history === "string") {
+      try { history = JSON.parse(history || "[]"); } catch { history = []; }
+    }
+    let schedulePaidCount = 0;
+    if (Array.isArray(schedule)) {
+      schedule = schedule.map((entry) => {
+        const entryDate = parseDueDate(entry?.dueDate);
+        if (!entryDate || entryDate > today || entry.status === "Paid") return entry;
+        schedulePaidCount += 1;
+        const installment = Number(entry.installment || schedulePaidCount);
+        if (!history.some((item) => Number(item.installment) === installment)) {
+          history.push({ installment, amount: Number(entry.amount || vehicle.emi_amount || 0), paidOn: formatDateOnly(entryDate), reference: `AUTO-EMI-${String(installment).padStart(3, "0")}`, status: "Auto Paid" });
+        }
+        return { ...entry, status: "Paid", autoPaid: true, paidAt: entry.paidAt || formatDateOnly(entryDate) };
+      });
+    }
+    const currentPaid = Number(vehicle.paid_emi || 0);
+    const maxPaid = Number(vehicle.tenure || 0) || 360;
+    const nextPaid = Math.min(maxPaid, Math.max(currentPaid + autoPaidCount, schedulePaidCount));
+    await pool.query(
+      "UPDATE vehicles SET paid_emi = ?, emi_schedule_json = ?, emi_history_json = ? WHERE id = ?",
+      [nextPaid, JSON.stringify(schedule), JSON.stringify(history), vehicleId]
+    );
+  }
+
   for (const task of existingDueRows) {
-    if (["Closed", "Proof Pending", "Verification Pending"].includes(task.status)) continue;
+    if (["Closed", "Proof Pending", "Verification Pending", "Auto Paid", "Paid"].includes(task.status)) continue;
     const days = daysUntil(task.due_date);
     if (days === null) continue;
     const nextStatus = dueStatusForDays(days);

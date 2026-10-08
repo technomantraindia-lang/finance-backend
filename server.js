@@ -783,6 +783,39 @@ function autoDueId(vehicleId, type, date) {
   return `auto-${String(type).toLowerCase()}-${String(vehicleId).replace(/[^a-z0-9]/gi, "")}-${formatDateOnly(parseDueDate(date))}`;
 }
 
+function dueTaskKey(task) {
+  const date = formatDateOnly(parseDueDate(task?.due_date ?? task?.dueDate));
+  return `${task?.vehicle_id ?? task?.vehicleId ?? ""}:${task?.type ?? "EMI"}:${date || task?.id || ""}`;
+}
+
+function dueTaskScore(task) {
+  let score = 0;
+  if (["Closed", "Proof Pending", "Verification Pending"].includes(task?.status)) score += 100;
+  if (String(task?.id ?? "").startsWith("auto-")) score += 10;
+  if (Number(task?.amount ?? 0) > 0) score += 1;
+  return score;
+}
+
+function deduplicateDueTasks(tasks) {
+  const byKey = new Map();
+  for (const task of tasks ?? []) {
+    const key = dueTaskKey(task);
+    if (!key || key.endsWith(":") || key.endsWith(":EMI:")) {
+      byKey.set(`${key}:${task?.id ?? Math.random()}`, task);
+      continue;
+    }
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, task);
+      continue;
+    }
+    const winner = dueTaskScore(task) > dueTaskScore(existing) ? task : existing;
+    const fallback = winner === task ? existing : task;
+    byKey.set(key, { ...fallback, ...winner });
+  }
+  return [...byKey.values()];
+}
+
 function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, amount = 0 }) {
   const parsedDate = parseDueDate(date);
   if (!clientId || !vehicleId || !type || !parsedDate) return null;
@@ -868,6 +901,7 @@ async function runMemoryDueDateMonitoring(source = "manual") {
   const clientsById = new Map(memoryClients.map((client) => [client.id, client]));
   const vehiclesByReg = new Map(memoryVehicles.map((vehicle) => [String(vehicle.reg_no || "").replace(/\W/g, "").toLowerCase(), vehicle]));
   const existingIds = new Set(memoryDues.map((task) => task.id));
+  const existingKeys = new Set(memoryDues.map(dueTaskKey));
   const candidates = [];
 
   for (const vehicle of memoryVehicles) {
@@ -888,9 +922,11 @@ async function runMemoryDueDateMonitoring(source = "manual") {
   }
 
   for (const candidate of candidates.filter(Boolean)) {
-    if (existingIds.has(candidate.id)) continue;
+    const key = dueTaskKey(candidate);
+    if (existingIds.has(candidate.id) || existingKeys.has(key)) continue;
     memoryDues.push(candidate);
     existingIds.add(candidate.id);
+    existingKeys.add(key);
     created += 1;
   }
 
@@ -923,6 +959,7 @@ async function runMysqlDueDateMonitoring(source = "manual") {
   const [imports] = await pool.query("SELECT * FROM client_imports");
   const [existingDueRows] = await pool.query("SELECT id, due_date, status, priority FROM due_tasks");
   const existingIds = new Set(existingDueRows.map((task) => task.id));
+  const existingKeys = new Set(existingDueRows.map(dueTaskKey));
   const vehiclesByReg = new Map(vehicles.map((vehicle) => [String(vehicle.reg_no || "").replace(/\W/g, "").toLowerCase(), vehicle]));
   const clientsById = new Map(vehicles.map((vehicle) => [vehicle.client_id, { id: vehicle.client_id, caller_id: vehicle.caller_id }]));
   const candidates = [];
@@ -953,13 +990,15 @@ async function runMysqlDueDateMonitoring(source = "manual") {
   }
 
   for (const candidate of candidates.filter(Boolean)) {
-    if (existingIds.has(candidate.id)) continue;
+    const key = dueTaskKey(candidate);
+    if (existingIds.has(candidate.id) || existingKeys.has(key)) continue;
     await pool.query(
       `INSERT INTO due_tasks (id, client_id, vehicle_id, type, amount, due_date, status, caller_id, priority)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [candidate.id, candidate.client_id, candidate.vehicle_id, candidate.type, candidate.amount, candidate.due_date, candidate.status, candidate.caller_id, candidate.priority]
     );
     existingIds.add(candidate.id);
+    existingKeys.add(key);
     created += 1;
   }
 
@@ -2694,13 +2733,13 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     const allowed = memoryClientIdsForRequest(req);
     if (isCustomerRequest(req)) {
-      return res.json(memoryDues.filter((task) => {
+    return res.json(deduplicateDueTasks(memoryDues.filter((task) => {
         if (!allowed.has(task.client_id)) return false;
         const vehicle = memoryVehicles.find((item) => item.id === task.vehicle_id);
         return String(vehicle?.status || "").toLowerCase() !== "sold";
-      }));
+      })));
     }
-    return res.json(allowed ? memoryDues.filter((task) => allowed.has(task.client_id)) : memoryDues);
+    return res.json(deduplicateDueTasks(allowed ? memoryDues.filter((task) => allowed.has(task.client_id)) : memoryDues));
   }
   const allowed = await mysqlClientIdsForRequest(req);
   if (isCustomerRequest(req)) {
@@ -2713,7 +2752,7 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
       "WHERE " + scope.clause + " AND (v.status IS NULL OR v.status <> 'Sold')",
       scope.params
     );
-    return res.json(rows);
+    return res.json(deduplicateDueTasks(rows));
   }
   const scope = allowed ? sqlScope(allowed, "d.client_id") : null;
   const [rows] = await pool.query(
@@ -2723,7 +2762,7 @@ app.get("/api/dues", asyncHandler(async (req, res) => {
      LEFT JOIN vehicles v ON v.id = d.vehicle_id` + (scope ? ` WHERE ${scope.clause}` : ""),
     scope?.params || []
   );
-  res.json(rows);
+  res.json(deduplicateDueTasks(rows));
 }));
 
 // ─── Listings ────────────────────────────────────────────
@@ -3097,7 +3136,7 @@ app.post("/api/marketplace-threads", (req, res) => {
 app.post("/api/sync", asyncHandler(async (req, res) => {
   const clients = Array.isArray(req.body?.clients) ? req.body.clients.map(normalizeClient).filter((row) => row.id && row.name) : [];
   const vehicles = Array.isArray(req.body?.vehicles) ? req.body.vehicles.map(normalizeVehicle).filter((row) => row.id && row.client_id) : [];
-  const incomingDueTasks = Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : [];
+  const incomingDueTasks = deduplicateDueTasks(Array.isArray(req.body?.dueTasks) ? req.body.dueTasks.map(normalizeDue).filter((row) => row.id && row.client_id) : []);
   const listings = Array.isArray(req.body?.listings) ? req.body.listings.map(normalizeListing).filter((row) => row.id && row.vehicle_id) : [];
   const callerActivities = Array.isArray(req.body?.callerActivities) ? req.body.callerActivities.map(normalizeCallerActivity).filter((row) => row.id && row.task_id) : [];
   const auditLogs = Array.isArray(req.body?.auditLogs) ? req.body.auditLogs.map(normalizeAuditLog).filter((row) => row.id) : [];
@@ -3111,7 +3150,7 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
     const scoped = await syncScopedData(req, { vehicles, incomingDueTasks, listings, callerActivities, documents, verificationItems, saleClosings, marketplaceThreads });
     return res.json({ ok: true, mode: dbAvailable ? "mysql-scoped" : "memory-scoped", synced: scoped });
   }
-  const dueTasks = appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs);
+  const dueTasks = deduplicateDueTasks(appendApprovedNextCycleTasks(incomingDueTasks, vehicles, auditLogs));
 
   await pingDb();
   if (!dbAvailable) {

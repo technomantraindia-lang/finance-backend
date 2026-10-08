@@ -2811,6 +2811,14 @@ app.get("/api/vehicles/:id", asyncHandler(async (req, res) => {
 // ─── Due Tasks ───────────────────────────────────────────
 app.get("/api/dues", asyncHandler(async (req, res) => {
   await pingDb();
+  // Keep the customer dues view current even when the scheduled monitor has
+  // not run since the last due date. This preserves date-based auto-payment
+  // semantics while avoiding a stale Due/Overdue row on the next app open.
+  try {
+    await runDueDateMonitoring("dues-read");
+  } catch (error) {
+    console.error("[due-monitor] dues-read refresh failed:", error.message);
+  }
   if (!dbAvailable) {
     const allowed = memoryClientIdsForRequest(req);
     if (isCustomerRequest(req)) {

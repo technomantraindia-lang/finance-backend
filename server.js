@@ -1547,6 +1547,10 @@ async function ensureClientImportsTable(conn = null) {
       if (!message.includes("duplicate column")) throw error;
     }
   }
+  // Older databases used a much shorter primary-key column here. Manual
+  // entries use generated IDs, so widen the existing column as part of the
+  // normal schema check instead of failing the whole sync transaction.
+  await query("ALTER TABLE client_imports MODIFY COLUMN id VARCHAR(64) NOT NULL");
   clientImportsReady = true;
 }
 
@@ -2418,7 +2422,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     return res.status(400).json({ error: "Name, email and password are required." });
   }
   const lowerEmail = String(email).trim().toLowerCase();
-  const id = `u-${Date.now()}`;
+  const id = `u-${Date.now().toString(36)}`;
   let clientId = `c-${id.slice(2)}`;
 
   await pingDb();

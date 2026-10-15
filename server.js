@@ -2005,6 +2005,32 @@ async function syncScopedData(req, payload) {
       const documentIds = ownDocuments.map((item) => item.id);
       await conn.query(`DELETE FROM documents WHERE ${clientScope.clause}${documentIds.length ? ` AND id NOT IN (${documentIds.map(() => "?").join(",")})` : ""}`, [...clientScope.params, ...documentIds]);
       for (const closing of ownSaleClosings) {
+        // A customer can mark a vehicle sold without having an active
+        // marketplace listing. Create a hidden sold listing as the parent
+        // before inserting the sale closing child row.
+        if (!closing.listing_id || !ownVehicleIds.has(closing.vehicle_id)) continue;
+        const [closingListingRows] = await conn.query(
+          "SELECT id FROM listings WHERE id = ? LIMIT 1",
+          [closing.listing_id]
+        );
+        if (!closingListingRows.length) {
+          const [closingVehicleRows] = await conn.query(
+            "SELECT reg_no, make, model, year FROM vehicles WHERE id = ? LIMIT 1",
+            [closing.vehicle_id]
+          );
+          const closingVehicle = closingVehicleRows[0];
+          if (closingVehicle) {
+            const title = [closingVehicle.year, closingVehicle.make, closingVehicle.model]
+              .filter(Boolean)
+              .join(" ") || closingVehicle.reg_no || `Sold vehicle ${closing.vehicle_id}`;
+            await conn.query(
+              `INSERT INTO listings
+                (id, vehicle_id, title, price, location, status, condition_note, photos_json)
+               VALUES (?, ?, ?, ?, ?, 'Sold', 'Good', '[]')`,
+              [closing.listing_id, closing.vehicle_id, title, Number(closing.estimated_amount || 0), "Customer app"]
+            );
+          }
+        }
         await conn.query(
           `REPLACE INTO sale_closings
             (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, status, updated_at)

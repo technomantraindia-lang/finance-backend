@@ -1506,11 +1506,7 @@ async function ensureAdminUser() {
   await pool.query(
     `INSERT INTO users (id, name, role, email, password_hash)
      VALUES ('u-admin', 'Admin', 'Admin', ?, ?)
-     ON DUPLICATE KEY UPDATE
-       name = VALUES(name),
-       role = VALUES(role),
-       email = VALUES(email),
-       password_hash = VALUES(password_hash)`,
+     ON DUPLICATE KEY UPDATE id = id`,
     [adminEmail, adminPassword]
   );
 }
@@ -2542,6 +2538,47 @@ app.delete("/api/clients/:id", asyncHandler(async (req, res) => {
   res.json({ ok: true, id: clientId, mode: "mysql" });
 }));
 
+// Update the authenticated admin's profile details.
+app.put("/api/users/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const id = String(req.params.id || "").trim();
+  if (id !== String(req.auth.userId || "")) {
+    return res.status(403).json({ error: "You can only update your own admin profile." });
+  }
+  const name = String(req.body?.name || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const mobile = String(req.body?.mobile || "").trim();
+  if (!name || !email) {
+    return res.status(400).json({ error: "Admin name and email are required." });
+  }
+
+  await pingDb();
+  if (!dbAvailable) {
+    const user = memoryUsers.find((item) => item.id === id && item.role === "Admin");
+    if (!user) return res.status(404).json({ error: "Admin account not found." });
+    if (memoryUsers.some((item) => item.id !== id && item.email === email)) {
+      return res.status(400).json({ error: "Email already exists." });
+    }
+    user.name = name;
+    user.email = email;
+    user.mobile = mobile;
+    return res.json({ ok: true, user: { id: user.id, name: user.name, role: user.role, email: user.email, mobile: user.mobile }, mode: "memory" });
+  }
+
+  await ensureUsersMobileColumn();
+  const [adminRows] = await pool.query("SELECT id, role FROM users WHERE id = ?", [id]);
+  if (!adminRows.length || adminRows[0].role !== "Admin") {
+    return res.status(404).json({ error: "Admin account not found." });
+  }
+  const [duplicateRows] = await pool.query(
+    "SELECT id FROM users WHERE LOWER(TRIM(email)) = ? AND id <> ? LIMIT 1",
+    [email, id]
+  );
+  if (duplicateRows.length) return res.status(400).json({ error: "Email already exists." });
+  await pool.query("UPDATE users SET name = ?, email = ?, mobile = ? WHERE id = ?", [name, email, mobile || null, id]);
+  res.json({ ok: true, user: { id, name, role: "Admin", email, mobile }, mode: "mysql" });
+}));
+
 // Delete a customer account + client
 app.delete("/api/users/:id", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
@@ -2706,7 +2743,7 @@ app.post("/api/login", asyncHandler(async (req, res) => {
 
 // Change customer's own password
 app.post("/api/change-password", asyncHandler(async (req, res) => {
-  const { id, newPassword } = req.body;
+  const { id, currentPassword, newPassword } = req.body;
   if (!req.auth || req.auth.userId !== String(id || "")) {
     return res.status(403).json({ error: "You can only change your own password." });
   }
@@ -2718,8 +2755,20 @@ app.post("/api/change-password", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     const user = memoryUsers.find((u) => u.id === lowerId);
     if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.role === "Admin") {
+      if (!currentPassword || !verifyPassword(currentPassword, user.password_hash)) {
+        return res.status(401).json({ error: "Current password is incorrect." });
+      }
+    }
     user.password_hash = String(newPassword);
     return res.json({ ok: true, mode: "memory" });
+  }
+  const [userRows] = await pool.query("SELECT role, password_hash FROM users WHERE id = ?", [lowerId]);
+  if (!userRows.length) return res.status(404).json({ error: "User not found" });
+  if (userRows[0].role === "Admin") {
+    if (!currentPassword || !verifyPassword(currentPassword, userRows[0].password_hash)) {
+      return res.status(401).json({ error: "Current password is incorrect." });
+    }
   }
   await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [String(newPassword), lowerId]);
   res.json({ ok: true, mode: "mysql" });

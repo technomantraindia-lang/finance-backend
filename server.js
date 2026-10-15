@@ -435,7 +435,7 @@ function normalizeListing(row) {
 }
 
 function isPublicMarketplaceListing(listing, vehicle, closing) {
-  return ["Active", "Reserved"].includes(listing.status)
+  return !["sold", "rejected", "disabled", "changes required"].includes(String(listing.status || "").trim().toLowerCase())
     && String(vehicle?.status || "").toLowerCase() !== "sold"
     && String(closing?.status || "").toLowerCase() !== "sold";
 }
@@ -1921,12 +1921,18 @@ async function syncScopedData(req, payload) {
       const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
       for (const listing of ownListings) {
         const current = memoryListings.find((item) => item.id === listing.id);
-        const linkedVehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
-        const protectedStatus = linkedVehicle?.status === "Sold"
-          ? "Sold"
-          : req.auth.role === "Customer"
-            ? (current?.status === "Disabled" ? "Disabled" : current?.status === "Reserved" ? "Reserved" : "Active")
-            : ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
+        // Listing publication and sale completion are separate actions.
+        // Do not infer a sale from the linked vehicle status: a customer can
+        // publish a listing while the vehicle is still owned/active.
+        const protectedStatus = req.auth.role === "Customer"
+          ? (listing.status === "Sold"
+            ? "Sold"
+            : current?.status === "Disabled"
+              ? "Disabled"
+              : current?.status === "Reserved"
+                ? "Reserved"
+                : "Active")
+          : ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
         upsertMemoryItem(memoryListings, { ...listing, status: protectedStatus });
       }
       const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
@@ -1966,8 +1972,6 @@ async function syncScopedData(req, payload) {
         }
       }
       for (const listing of ownListings) {
-        const [linkedVehicleRows] = await conn.query("SELECT status FROM vehicles WHERE id = ? AND client_id = ? LIMIT 1", [listing.vehicle_id, req.auth.clientId]);
-        const linkedVehicleStatus = linkedVehicleRows[0]?.status;
         const listingStatusUpdate = req.auth.role === "Customer"
           ? "CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Disabled', 'Rejected') THEN listings.status WHEN listings.status = 'Reserved' THEN 'Reserved' ELSE 'Active' END"
           : "CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END";
@@ -1983,7 +1987,7 @@ async function syncScopedData(req, payload) {
              condition_note = VALUES(condition_note),
              photos_json = VALUES(photos_json),
              status = ${listingStatusUpdate}`,
-          [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, linkedVehicleStatus === "Sold" ? "Sold" : listing.status, listing.condition_note, JSON.stringify(listing.photos)]
+          [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note, JSON.stringify(listing.photos)]
         );
       }
       const [taskRows] = await conn.query("SELECT id FROM due_tasks WHERE client_id = ?", [req.auth.clientId]);
@@ -2862,18 +2866,32 @@ app.get("/api/vehicles", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
     const allowed = memoryClientIdsForRequest(req);
-    return res.json((allowed ? memoryVehicles.filter((vehicle) => allowed.has(vehicle.client_id)) : memoryVehicles).map((vehicle) => safeVehicleForRole(vehicle, req)));
+    const rows = allowed ? memoryVehicles.filter((vehicle) => allowed.has(vehicle.client_id)) : memoryVehicles;
+    return res.json(rows.map((vehicle) => {
+      const hasSaleClosing = memorySaleClosings.some((closing) => closing.vehicle_id === vehicle.id && closing.status === "Sold");
+      const customerVehicle = isCustomerRequest(req) && vehicle.status === "Sold" && !hasSaleClosing
+        ? { ...vehicle, status: "Listed", sold_date: null }
+        : vehicle;
+      return safeVehicleForRole(customerVehicle, req);
+    }));
   }
   const allowed = await mysqlClientIdsForRequest(req);
   const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
+  if (isCustomerRequest(req)) await ensureSaleClosingsTable();
   const [rows] = await pool.query(
     `SELECT v.*, c.name AS client_name
+            , EXISTS (SELECT 1 FROM sale_closings sc WHERE sc.vehicle_id = v.id AND sc.status = 'Sold') AS has_sold_closing
      FROM vehicles v
      LEFT JOIN clients c ON c.id = v.client_id`
      + (scope ? ` WHERE ${scope.clause}` : ""),
     scope?.params || []
   );
-  res.json(rows.map((row) => safeVehicleForRole(row, req)));
+  res.json(rows.map((row) => {
+    const customerVehicle = isCustomerRequest(req) && row.status === "Sold" && !Number(row.has_sold_closing)
+      ? { ...row, status: "Listed", sold_date: null }
+      : row;
+    return safeVehicleForRole(customerVehicle, req);
+  }));
 }));
 
 app.get("/api/vehicles/:id", asyncHandler(async (req, res) => {
@@ -2951,8 +2969,13 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
     if (req.auth.role === "Caller") return res.json([]);
     if (isCustomerRequest(req)) return res.json(memoryListings.filter((listing) => {
       const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
+      const hasSaleClosing = memorySaleClosings.some((item) => item.vehicle_id === listing.vehicle_id && item.status === "Sold");
+      const effectiveVehicle = vehicle?.status === "Sold" && !hasSaleClosing ? { ...vehicle, status: "Listed" } : vehicle;
+      const effectiveListing = String(listing.status || "").toLowerCase() === "sold" && !hasSaleClosing
+        ? { ...listing, status: "Active" }
+        : listing;
       const closing = memorySaleClosings.find((item) => item.listing_id === listing.id);
-      return isPublicMarketplaceListing(listing, vehicle, closing);
+      return isPublicMarketplaceListing(effectiveListing, effectiveVehicle, closing);
     }));
     return res.json((allowed ? memoryListings.filter((listing) => {
       const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
@@ -2962,14 +2985,16 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
   const allowed = await mysqlClientIdsForRequest(req);
   if (req.auth.role === "Caller") return res.json([]);
   if (isCustomerRequest(req)) {
+    await ensureSaleClosingsTable();
     const [rows] = await pool.query(
       "SELECT l.* FROM listings l " +
       "JOIN vehicles v ON v.id = l.vehicle_id " +
-      "WHERE l.status IN ('Active', 'Reserved') " +
-      "AND (v.status IS NULL OR v.status <> 'Sold') " +
+      "WHERE (LOWER(TRIM(l.status)) NOT IN ('sold', 'rejected', 'disabled', 'changes required') " +
+      "OR (LOWER(TRIM(l.status)) = 'sold' AND NOT EXISTS (SELECT 1 FROM sale_closings sc0 WHERE sc0.listing_id = l.id AND sc0.status = 'Sold'))) " +
+      "AND (v.status IS NULL OR v.status <> 'Sold' OR NOT EXISTS (SELECT 1 FROM sale_closings sc1 WHERE sc1.vehicle_id = v.id AND sc1.status = 'Sold')) " +
       "AND NOT EXISTS (SELECT 1 FROM sale_closings sc WHERE sc.listing_id = l.id AND sc.status = 'Sold')"
     );
-    return res.json(rows.map(normalizeListing));
+    return res.json(rows.map((row) => normalizeListing({ ...row, status: String(row.status || "").toLowerCase() === "sold" ? "Active" : row.status })));
   }
   const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(

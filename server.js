@@ -1924,7 +1924,9 @@ async function syncScopedData(req, payload) {
         const linkedVehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
         const protectedStatus = linkedVehicle?.status === "Sold"
           ? "Sold"
-          : ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
+          : req.auth.role === "Customer"
+            ? (current?.status === "Disabled" ? "Disabled" : current?.status === "Reserved" ? "Reserved" : "Active")
+            : ["Active", "Reserved", "Sold"].includes(current?.status) ? current.status : "Submitted";
         upsertMemoryItem(memoryListings, { ...listing, status: protectedStatus });
       }
       const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
@@ -1966,6 +1968,9 @@ async function syncScopedData(req, payload) {
       for (const listing of ownListings) {
         const [linkedVehicleRows] = await conn.query("SELECT status FROM vehicles WHERE id = ? AND client_id = ? LIMIT 1", [listing.vehicle_id, req.auth.clientId]);
         const linkedVehicleStatus = linkedVehicleRows[0]?.status;
+        const listingStatusUpdate = req.auth.role === "Customer"
+          ? "CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Disabled', 'Rejected') THEN listings.status WHEN listings.status = 'Reserved' THEN 'Reserved' ELSE 'Active' END"
+          : "CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END";
         await conn.query(
           `INSERT INTO listings
             (id, vehicle_id, title, price, location, status, condition_note, photos_json)
@@ -1977,7 +1982,7 @@ async function syncScopedData(req, payload) {
              location = VALUES(location),
              condition_note = VALUES(condition_note),
              photos_json = VALUES(photos_json),
-             status = CASE WHEN VALUES(status) = 'Sold' THEN 'Sold' WHEN listings.status IN ('Active', 'Reserved', 'Sold') THEN listings.status ELSE 'Submitted' END`,
+             status = ${listingStatusUpdate}`,
           [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, linkedVehicleStatus === "Sold" ? "Sold" : listing.status, listing.condition_note, JSON.stringify(listing.photos)]
         );
       }

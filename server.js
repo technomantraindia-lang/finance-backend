@@ -666,9 +666,15 @@ function normalizeMarketplaceInterest(row) {
 }
 
 function serializeMarketplaceInterest(row) {
-  const messages = Array.isArray(row.messages) && row.messages.length
-    ? row.messages
-    : (row.name ? [marketplaceInterestInitialMessage(row)] : []);
+  let messages = row.messages || row.messages_json || [];
+  if (typeof messages === "string") {
+    try {
+      messages = JSON.parse(messages || "[]");
+    } catch {
+      messages = [];
+    }
+  }
+  if (!Array.isArray(messages) || !messages.length) messages = row.name ? [marketplaceInterestInitialMessage(row)] : [];
   return {
     id: row.id,
     listingId: row.listing_id,

@@ -612,12 +612,12 @@ function marketplaceMoney(value) {
   return `INR ${Number.isFinite(amount) ? new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(amount) : "0"}`;
 }
 
-function marketplaceVehicleDetailsMessage(listing, vehicle) {
+function marketplaceVehicleDetailsMessage(listing, vehicle, trailer = null) {
   const paidEmi = Number(vehicle.paid_emi || 0);
   const tenure = Number(vehicle.tenure || 0);
   const remainingEmi = Math.max(tenure - paidEmi, 0);
   const value = (item) => item === null || item === undefined || item === "" ? "-" : String(item);
-  return [
+  const lines = [
     "ADMIN APPROVED VEHICLE DETAILS",
     `Vehicle: ${value(listing?.title || vehicle?.model || vehicle?.reg_no)}`,
     `Registration: ${value(vehicle?.reg_no)}`,
@@ -636,7 +636,33 @@ function marketplaceVehicleDetailsMessage(listing, vehicle) {
     `Permit number: ${value(vehicle?.permit_no)}`,
     `Permit expiry: ${value(vehicle?.permit_expiry || vehicle?.national_permit_expiry)}`,
     `Fitness expiry: ${value(vehicle?.fitness_expiry)}`
-  ].join("\n");
+  ];
+  if (trailer) {
+    const trailerPaidEmi = Number(trailer.paid_emi || 0);
+    const trailerTenure = Number(trailer.tenure || 0);
+    lines.push(
+      "",
+      "LINKED TRAILER DETAILS",
+      `Trailer registration: ${value(trailer.reg_no)}`,
+      `Trailer make: ${value(trailer.make)}`,
+      `Trailer model: ${value(trailer.model)}`,
+      `Trailer loan amount: ${marketplaceMoney(trailer.loan_amount)}`,
+      `Trailer closing principal: ${marketplaceMoney(trailer.principal)}`,
+      `Trailer EMI amount: ${marketplaceMoney(trailer.emi_amount)}`,
+      `Trailer EMI paid: ${trailerPaidEmi}`,
+      `Trailer EMI remaining: ${Math.max(trailerTenure - trailerPaidEmi, 0)}`,
+      `Trailer total tenure: ${trailerTenure || "-"}`,
+      `Trailer PUC number: ${value(trailer.puc_no)}`,
+      `Trailer PUC expiry: ${value(trailer.puc_expiry)}`,
+      `Trailer insurance company: ${value(trailer.insurance_company)}`,
+      `Trailer insurance policy number: ${value(trailer.insurance_policy_no)}`,
+      `Trailer insurance expiry: ${value(trailer.insurance_expiry)}`,
+      `Trailer permit number: ${value(trailer.permit_no)}`,
+      `Trailer permit expiry: ${value(trailer.permit_expiry || trailer.national_permit_expiry)}`,
+      `Trailer fitness expiry: ${value(trailer.fitness_expiry)}`
+    );
+  }
+  return lines.join("\n");
 }
 
 function normalizeMarketplaceInterest(row) {
@@ -3247,11 +3273,15 @@ app.post("/api/marketplace-interests", asyncHandler(async (req, res) => {
   let clientId = String(req.auth.clientId || "");
   if (!clientId && !dbAvailable) clientId = [...memoryAllowed][0] || "";
   if (!clientId && dbAvailable) clientId = (await mysqlClientIdsForRequest(req))[0] || "";
+  if (!clientId) clientId = `user:${String(req.auth.userId || "unknown")}`;
   const initialMessage = marketplaceInterestInitialMessage({ id, requesterClientId: clientId, name, phone, email, address, message, createdAt });
   if (!dbAvailable) {
     const listing = memoryListings.find((item) => item.id === listingId && item.vehicle_id === vehicleId);
     const vehicle = memoryVehicles.find((item) => item.id === vehicleId);
     if (!listing || !vehicle || String(listing.status).toLowerCase() === "sold" || String(vehicle.status).toLowerCase() === "sold") return res.status(404).json({ error: "This listing is no longer available." });
+    if (memoryMarketplaceInterests.some((item) => item.listing_id === listingId && item.requester_client_id === clientId)) {
+      return res.status(409).json({ error: "You have already applied for this vehicle." });
+    }
     const row = normalizeMarketplaceInterest({ id, listingId, vehicleId, requesterClientId: clientId, name, phone, email, address, message, createdAt, messages: [initialMessage] });
     memoryMarketplaceInterests.unshift(row);
     return res.status(201).json(serializeMarketplaceInterest(row));
@@ -3264,6 +3294,11 @@ app.post("/api/marketplace-interests", asyncHandler(async (req, res) => {
   if (!rows.length || ["sold", "disabled", "rejected"].includes(String(rows[0].status || "").toLowerCase()) || String(rows[0].vehicle_status || "").toLowerCase() === "sold") {
     return res.status(404).json({ error: "This listing is no longer available." });
   }
+  const [existingInterests] = await pool.query(
+    "SELECT id FROM marketplace_interest_requests WHERE listing_id = ? AND requester_client_id = ? LIMIT 1",
+    [listingId, clientId]
+  );
+  if (existingInterests.length) return res.status(409).json({ error: "You have already applied for this vehicle." });
   await pool.query(
     `INSERT INTO marketplace_interest_requests (id, listing_id, vehicle_id, requester_client_id, name, phone, email, address, message, messages_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, listingId, vehicleId, clientId, name, phone, email, address, message, JSON.stringify([initialMessage]), createdAt]
@@ -3353,12 +3388,12 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
   if (!interestId) return res.status(400).json({ error: "Interest request is required." });
   await pingDb();
   const now = new Date().toISOString();
-  const approvalMessage = (listing, vehicle) => ({
+  const approvalMessage = (listing, vehicle, trailer) => ({
     id: `m-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`,
     senderId: String(req.auth.userId || ""),
     senderRole: "Admin",
     senderName: "Admin",
-    text: marketplaceVehicleDetailsMessage(listing, vehicle),
+    text: marketplaceVehicleDetailsMessage(listing, vehicle, trailer),
     sentAt: now
   });
   if (!dbAvailable) {
@@ -3366,15 +3401,20 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
     const listing = interest ? memoryListings.find((item) => item.id === interest.listing_id) : null;
     const vehicle = interest ? memoryVehicles.find((item) => item.id === interest.vehicle_id) : null;
     if (!interest || !listing || !vehicle) return res.status(404).json({ error: "Interest request not found." });
+    const baseRegistration = String(vehicle.reg_no || "").replace(/\s+body\b/i, "").trim().toLowerCase();
+    const trailer = memoryVehicles.find((item) => item.id !== vehicle.id
+      && String(item.type || "").toLowerCase() === "trailer"
+      && item.client_id === vehicle.client_id
+      && String(item.reg_no || "").replace(/\s+body\b/i, "").trim().toLowerCase() === baseRegistration);
     const messages = Array.isArray(interest.messages) && interest.messages.length ? interest.messages : [marketplaceInterestInitialMessage(interest)];
-    interest.messages = [...messages, approvalMessage(listing, vehicle)];
+    interest.messages = [...messages, approvalMessage(listing, vehicle, trailer)];
     interest.details_shared_at = now;
     return res.json(serializeMarketplaceInterest(interest));
   }
   await ensureMarketplaceInterestsTable();
   const [rows] = await pool.query(
     `SELECT i.*, l.title AS listing_title, l.location AS listing_location,
-            v.reg_no, v.model, v.loan_amount, v.principal, v.emi_amount, v.paid_emi, v.tenure,
+            v.client_id AS vehicle_client_id, v.reg_no, v.model, v.loan_amount, v.principal, v.emi_amount, v.paid_emi, v.tenure,
             v.puc_no, v.puc_expiry, v.insurance_company, v.insurance_policy_no, v.insurance_expiry,
             v.permit_no, v.permit_expiry, v.national_permit_expiry, v.fitness_expiry
      FROM marketplace_interest_requests i
@@ -3385,12 +3425,22 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
   );
   const interest = rows[0];
   if (!interest || !interest.id || !interest.vehicle_id) return res.status(404).json({ error: "Interest request not found." });
+  const [trailerRows] = await pool.query(
+    `SELECT * FROM vehicles
+     WHERE client_id = ?
+       AND UPPER(type) = 'TRAILER'
+       AND REPLACE(UPPER(reg_no), ' BODY', '') = REPLACE(UPPER(?), ' BODY', '')
+       AND id <> ?
+     LIMIT 1`,
+    [interest.vehicle_client_id, interest.reg_no, interest.vehicle_id]
+  );
+  const trailer = trailerRows[0] || null;
   let messages = interest.messages_json || [];
   if (typeof messages === "string") {
     try { messages = JSON.parse(messages || "[]"); } catch { messages = []; }
   }
   if (!Array.isArray(messages) || !messages.length) messages = [marketplaceInterestInitialMessage(interest)];
-  messages.push(approvalMessage({ title: interest.listing_title, location: interest.listing_location }, interest));
+  messages.push(approvalMessage({ title: interest.listing_title, location: interest.listing_location }, interest, trailer));
   await pool.query("UPDATE marketplace_interest_requests SET messages_json = ?, details_shared_at = ? WHERE id = ?", [JSON.stringify(messages), now, interestId]);
   const [saved] = await pool.query(
     `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration

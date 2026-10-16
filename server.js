@@ -607,6 +607,38 @@ function marketplaceInterestInitialMessage(row) {
   };
 }
 
+function marketplaceMoney(value) {
+  const amount = Number(value || 0);
+  return `INR ${Number.isFinite(amount) ? new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(amount) : "0"}`;
+}
+
+function marketplaceVehicleDetailsMessage(listing, vehicle) {
+  const paidEmi = Number(vehicle.paid_emi || 0);
+  const tenure = Number(vehicle.tenure || 0);
+  const remainingEmi = Math.max(tenure - paidEmi, 0);
+  const value = (item) => item === null || item === undefined || item === "" ? "-" : String(item);
+  return [
+    "ADMIN APPROVED VEHICLE DETAILS",
+    `Vehicle: ${value(listing?.title || vehicle?.model || vehicle?.reg_no)}`,
+    `Registration: ${value(vehicle?.reg_no)}`,
+    `Location: ${value(listing?.location)}`,
+    `Loan amount: ${marketplaceMoney(vehicle?.loan_amount)}`,
+    `Closing principal: ${marketplaceMoney(vehicle?.principal)}`,
+    `EMI amount: ${marketplaceMoney(vehicle?.emi_amount)}`,
+    `EMI paid: ${paidEmi}`,
+    `EMI remaining: ${remainingEmi}`,
+    `Total tenure: ${tenure || "-"}`,
+    `PUC number: ${value(vehicle?.puc_no)}`,
+    `PUC expiry: ${value(vehicle?.puc_expiry)}`,
+    `Insurance company: ${value(vehicle?.insurance_company)}`,
+    `Insurance policy number: ${value(vehicle?.insurance_policy_no)}`,
+    `Insurance expiry: ${value(vehicle?.insurance_expiry)}`,
+    `Permit number: ${value(vehicle?.permit_no)}`,
+    `Permit expiry: ${value(vehicle?.permit_expiry || vehicle?.national_permit_expiry)}`,
+    `Fitness expiry: ${value(vehicle?.fitness_expiry)}`
+  ].join("\n");
+}
+
 function normalizeMarketplaceInterest(row) {
   let messages = row.messages || row.messages_json || [];
   if (typeof messages === "string") {
@@ -628,6 +660,7 @@ function normalizeMarketplaceInterest(row) {
     address: String(row.address || "").trim(),
     message: String(row.message || "").trim(),
     messages: Array.isArray(messages) ? messages : [],
+    details_shared_at: row.detailsSharedAt || row.details_shared_at || "",
     created_at: row.createdAt || row.created_at || new Date().toISOString()
   };
 }
@@ -647,6 +680,7 @@ function serializeMarketplaceInterest(row) {
     address: row.address || "",
     message: row.message || "",
     messages,
+    approvedAt: row.details_shared_at || "",
     listingTitle: row.listing_title || "",
     listingLocation: row.listing_location || "",
     registration: row.registration || "",
@@ -1811,6 +1845,7 @@ async function ensureMarketplaceInterestsTable(conn = null) {
       address TEXT NOT NULL,
       message TEXT NOT NULL,
       messages_json JSON,
+      details_shared_at VARCHAR(64),
       created_at VARCHAR(64),
       INDEX idx_marketplace_interest_listing (listing_id),
       INDEX idx_marketplace_interest_client (requester_client_id),
@@ -1821,6 +1856,7 @@ async function ensureMarketplaceInterestsTable(conn = null) {
   const [columns] = await query("SHOW COLUMNS FROM marketplace_interest_requests");
   const columnNames = new Set(columns.map((column) => column.Field));
   if (!columnNames.has("messages_json")) await query("ALTER TABLE marketplace_interest_requests ADD COLUMN messages_json JSON NULL");
+  if (!columnNames.has("details_shared_at")) await query("ALTER TABLE marketplace_interest_requests ADD COLUMN details_shared_at VARCHAR(64) NULL");
   marketplaceInterestsReady = true;
 }
 
@@ -3294,6 +3330,62 @@ app.post("/api/marketplace-interests/:id/messages", asyncHandler(async (req, res
   if (!messages.length) messages.push(marketplaceInterestInitialMessage(row));
   messages.push(message);
   await pool.query("UPDATE marketplace_interest_requests SET messages_json = ?, created_at = ? WHERE id = ?", [JSON.stringify(messages), now, interestId]);
+  const [saved] = await pool.query(
+    `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration
+     FROM marketplace_interest_requests i
+     LEFT JOIN listings l ON l.id = i.listing_id
+     LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     WHERE i.id = ? LIMIT 1`,
+    [interestId]
+  );
+  res.json(serializeMarketplaceInterest(saved[0]));
+}));
+
+app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res) => {
+  if (!isAdminRequest(req)) return res.status(403).json({ error: "Only an admin can approve and share vehicle details." });
+  const interestId = String(req.params.id || "").trim();
+  if (!interestId) return res.status(400).json({ error: "Interest request is required." });
+  await pingDb();
+  const now = new Date().toISOString();
+  const approvalMessage = (listing, vehicle) => ({
+    id: `m-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`,
+    senderId: String(req.auth.userId || ""),
+    senderRole: "Admin",
+    senderName: "Admin",
+    text: marketplaceVehicleDetailsMessage(listing, vehicle),
+    sentAt: now
+  });
+  if (!dbAvailable) {
+    const interest = memoryMarketplaceInterests.find((item) => item.id === interestId);
+    const listing = interest ? memoryListings.find((item) => item.id === interest.listing_id) : null;
+    const vehicle = interest ? memoryVehicles.find((item) => item.id === interest.vehicle_id) : null;
+    if (!interest || !listing || !vehicle) return res.status(404).json({ error: "Interest request not found." });
+    const messages = Array.isArray(interest.messages) && interest.messages.length ? interest.messages : [marketplaceInterestInitialMessage(interest)];
+    interest.messages = [...messages, approvalMessage(listing, vehicle)];
+    interest.details_shared_at = now;
+    return res.json(serializeMarketplaceInterest(interest));
+  }
+  await ensureMarketplaceInterestsTable();
+  const [rows] = await pool.query(
+    `SELECT i.*, l.title AS listing_title, l.location AS listing_location,
+            v.reg_no, v.model, v.loan_amount, v.principal, v.emi_amount, v.paid_emi, v.tenure,
+            v.puc_no, v.puc_expiry, v.insurance_company, v.insurance_policy_no, v.insurance_expiry,
+            v.permit_no, v.permit_expiry, v.national_permit_expiry, v.fitness_expiry
+     FROM marketplace_interest_requests i
+     LEFT JOIN listings l ON l.id = i.listing_id
+     LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     WHERE i.id = ? LIMIT 1`,
+    [interestId]
+  );
+  const interest = rows[0];
+  if (!interest || !interest.id || !interest.vehicle_id) return res.status(404).json({ error: "Interest request not found." });
+  let messages = interest.messages_json || [];
+  if (typeof messages === "string") {
+    try { messages = JSON.parse(messages || "[]"); } catch { messages = []; }
+  }
+  if (!Array.isArray(messages) || !messages.length) messages = [marketplaceInterestInitialMessage(interest)];
+  messages.push(approvalMessage({ title: interest.listing_title, location: interest.listing_location }, interest));
+  await pool.query("UPDATE marketplace_interest_requests SET messages_json = ?, details_shared_at = ? WHERE id = ?", [JSON.stringify(messages), now, interestId]);
   const [saved] = await pool.query(
     `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration
      FROM marketplace_interest_requests i

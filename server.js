@@ -3060,7 +3060,7 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
       "AND (v.status IS NULL OR v.status <> 'Sold' OR NOT EXISTS (SELECT 1 FROM sale_closings sc1 WHERE sc1.vehicle_id = v.id AND sc1.status = 'Sold')) " +
       "AND NOT EXISTS (SELECT 1 FROM sale_closings sc WHERE sc.listing_id = l.id AND sc.status = 'Sold')"
     );
-    return res.json(rows.map((row) => normalizeListing({ ...row, is_owner: allowed.has(row.listing_client_id), status: String(row.status || "").toLowerCase() === "sold" ? "Active" : row.status })));
+    return res.json(rows.map((row) => normalizeListing({ ...row, is_owner: allowed.includes(row.listing_client_id), status: String(row.status || "").toLowerCase() === "sold" ? "Active" : row.status })));
   }
   const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(
@@ -3068,7 +3068,7 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
      ${scope ? `WHERE l.status IN ('Active', 'Reserved') OR ${scope.clause}` : ""}`,
     scope?.params || []
   );
-  res.json(rows.map((row) => normalizeListing({ ...row, is_owner: Boolean(allowed?.has(row.listing_client_id)) })));
+  res.json(rows.map((row) => normalizeListing({ ...row, is_owner: Boolean(allowed?.includes(row.listing_client_id)) })));
 }));
 
 // ─── Caller Activities ──────────────────────────────────

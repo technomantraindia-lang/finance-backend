@@ -1901,7 +1901,12 @@ async function canAccessClientId(req, clientId) {
 async function syncScopedData(req, payload) {
   await pingDb();
   if (isCustomerRequest(req)) {
-    const allowed = new Set([req.auth.clientId].filter(Boolean));
+    // Do not rely only on auth.clientId. Older customer sessions may not carry
+    // clientId, while the same authenticated email/name still resolves to the
+    // correct client through mysqlClientIdsForRequest(). Without this fallback,
+    // a customer listing was accepted with 200 OK but never inserted because
+    // ownVehicleIds was empty.
+    const allowed = new Set(dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)]);
     const ownDocuments = (payload.documents || []).filter((item) => allowed.has(item.client_id));
     const ownSaleClosings = (payload.saleClosings || []).filter((item) => allowed.has(item.client_id));
     const ownThreads = (payload.marketplaceThreads || []).filter((item) => allowed.has(item.buyer_client_id) || allowed.has(item.seller_client_id));
@@ -1966,13 +1971,13 @@ async function syncScopedData(req, payload) {
       const ownVehicleIds = new Set(vehicleRows.map((row) => row.id));
       for (const vehicle of payload.vehicles || []) {
         if (ownVehicleIds.has(vehicle.id) && ["Active", "Listed", "Sold"].includes(vehicle.status)) {
-          await conn.query("UPDATE vehicles SET status = ?, sold_date = ? WHERE id = ? AND client_id = ?", [vehicle.status, vehicle.sold_date || null, vehicle.id, req.auth.clientId]);
+          await conn.query(`UPDATE vehicles SET status = ?, sold_date = ? WHERE id = ? AND ${clientScope.clause}`, [vehicle.status, vehicle.sold_date || null, vehicle.id, ...clientScope.params]);
         }
       }
       const ownListings = (payload.listings || []).filter((item) => ownVehicleIds.has(item.vehicle_id));
       for (const task of payload.dueTasks || []) {
         if (task.status === "Proof Pending") {
-          await conn.query("UPDATE due_tasks SET status = 'Proof Pending' WHERE id = ? AND client_id = ?", [task.id, req.auth.clientId]);
+          await conn.query(`UPDATE due_tasks SET status = 'Proof Pending' WHERE id = ? AND ${clientScope.clause}`, [task.id, ...clientScope.params]);
         }
       }
       for (const listing of ownListings) {
@@ -1994,7 +1999,7 @@ async function syncScopedData(req, payload) {
           [listing.id, listing.vehicle_id, listing.title, listing.price, listing.location, listing.status, listing.condition_note, JSON.stringify(listing.photos)]
         );
       }
-      const [taskRows] = await conn.query("SELECT id FROM due_tasks WHERE client_id = ?", [req.auth.clientId]);
+      const [taskRows] = await conn.query(`SELECT id FROM due_tasks WHERE ${clientScope.clause}`, clientScope.params);
       const ownTaskIds = new Set(taskRows.map((row) => row.id));
       const verifiedItems = ownVerificationItems.filter((item) => ownTaskIds.has(item.task_id));
       for (const item of verifiedItems) {
@@ -2006,7 +2011,7 @@ async function syncScopedData(req, payload) {
         );
       }
       const verificationTaskIds = verifiedItems.map((item) => item.task_id);
-      await conn.query(`DELETE v FROM verification_items v JOIN due_tasks d ON d.id = v.task_id WHERE d.client_id = ?${verificationTaskIds.length ? ` AND v.task_id NOT IN (${verificationTaskIds.map(() => "?").join(",")})` : ""}`, [req.auth.clientId, ...verificationTaskIds]);
+      await conn.query(`DELETE v FROM verification_items v JOIN due_tasks d ON d.id = v.task_id WHERE ${clientScope.clause.replace("client_id", "d.client_id")}${verificationTaskIds.length ? ` AND v.task_id NOT IN (${verificationTaskIds.map(() => "?").join(",")})` : ""}`, [...clientScope.params, ...verificationTaskIds]);
       for (const document of ownDocuments) {
         await conn.query(
           `REPLACE INTO documents

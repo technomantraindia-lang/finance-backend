@@ -39,6 +39,8 @@ let verificationItemsReady = false;
 let verificationItemsPromise = null;
 let saleClosingsReady = false;
 let saleClosingsPromise = null;
+let marketplaceInterestsReady = false;
+let marketplaceInterestsPromise = null;
 let marketplaceThreadsReady = false;
 let marketplaceThreadsPromise = null;
 let whatsappMessagesReady = false;
@@ -153,6 +155,7 @@ const memoryClientImports = [];
 const memoryDocuments = [];
 const memoryVerificationItems = [];
 const memorySaleClosings = [];
+const memoryMarketplaceInterests = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
 const defaultRolePermissions = [
@@ -584,6 +587,39 @@ function serializeSaleClosing(row) {
     soldType: row.sold_type || "",
     status: row.status || "Estimated",
     updatedAt: row.updated_at || ""
+  };
+}
+
+function normalizeMarketplaceInterest(row) {
+  return {
+    id: String(row.id || `mi-${Date.now()}`),
+    listing_id: String(row.listingId || row.listing_id || ""),
+    vehicle_id: String(row.vehicleId || row.vehicle_id || ""),
+    requester_client_id: String(row.requesterClientId || row.requester_client_id || row.clientId || row.client_id || ""),
+    name: String(row.name || "").trim(),
+    phone: String(row.phone || row.number || "").trim(),
+    email: String(row.email || "").trim(),
+    address: String(row.address || "").trim(),
+    message: String(row.message || "").trim(),
+    created_at: row.createdAt || row.created_at || new Date().toISOString()
+  };
+}
+
+function serializeMarketplaceInterest(row) {
+  return {
+    id: row.id,
+    listingId: row.listing_id,
+    vehicleId: row.vehicle_id,
+    requesterClientId: row.requester_client_id || "",
+    name: row.name || "",
+    phone: row.phone || "",
+    email: row.email || "",
+    address: row.address || "",
+    message: row.message || "",
+    listingTitle: row.listing_title || "",
+    listingLocation: row.listing_location || "",
+    registration: row.registration || "",
+    createdAt: row.created_at || ""
   };
 }
 
@@ -1718,6 +1754,39 @@ async function ensureSaleClosingsTable(conn = null) {
   if (!columnNames.has("buyer_name")) await query("ALTER TABLE sale_closings ADD COLUMN buyer_name VARCHAR(255) DEFAULT ''");
   if (!columnNames.has("sold_type")) await query("ALTER TABLE sale_closings ADD COLUMN sold_type VARCHAR(64) DEFAULT ''");
   saleClosingsReady = true;
+}
+
+async function ensureMarketplaceInterestsTable(conn = null) {
+  if (!dbAvailable) return;
+  if (marketplaceInterestsReady) return;
+  if (!conn && marketplaceInterestsPromise) return marketplaceInterestsPromise;
+  if (!conn) {
+    marketplaceInterestsPromise = ensureMarketplaceInterestsTable(pool)
+      .finally(() => {
+        marketplaceInterestsPromise = null;
+      });
+    return marketplaceInterestsPromise;
+  }
+  const query = conn.query.bind(conn);
+  await query(
+    `CREATE TABLE IF NOT EXISTS marketplace_interest_requests (
+      id VARCHAR(64) PRIMARY KEY,
+      listing_id VARCHAR(48) NOT NULL,
+      vehicle_id VARCHAR(48) NOT NULL,
+      requester_client_id VARCHAR(32) DEFAULT '',
+      name VARCHAR(160) NOT NULL,
+      phone VARCHAR(64) NOT NULL,
+      email VARCHAR(190) NOT NULL,
+      address TEXT NOT NULL,
+      message TEXT NOT NULL,
+      created_at VARCHAR(64),
+      INDEX idx_marketplace_interest_listing (listing_id),
+      INDEX idx_marketplace_interest_client (requester_client_id),
+      FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+      FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
+    )`
+  );
+  marketplaceInterestsReady = true;
 }
 
 async function ensureMarketplaceThreadsTable(conn = null) {
@@ -3082,6 +3151,61 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
 }));
 
 // ─── Caller Activities ──────────────────────────────────
+app.post("/api/marketplace-interests", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Only customers can submit marketplace interest." });
+  const listingId = String(req.body?.listingId || "").trim();
+  const vehicleId = String(req.body?.vehicleId || "").trim();
+  const name = String(req.body?.name || "").trim().slice(0, 160);
+  const phone = String(req.body?.phone || "").trim().slice(0, 64);
+  const email = String(req.body?.email || "").trim().slice(0, 190);
+  const address = String(req.body?.address || "").trim().slice(0, 1000);
+  const message = String(req.body?.message || "").trim().slice(0, 2000);
+  if (!listingId || !vehicleId || !name || !phone || !email || !address || !message) {
+    return res.status(400).json({ error: "Name, number, email, address and message are required." });
+  }
+  await pingDb();
+  const id = `mi-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+  const createdAt = new Date().toISOString();
+  const clientId = String(req.auth.clientId || "");
+  if (!dbAvailable) {
+    const listing = memoryListings.find((item) => item.id === listingId && item.vehicle_id === vehicleId);
+    const vehicle = memoryVehicles.find((item) => item.id === vehicleId);
+    if (!listing || !vehicle || String(listing.status).toLowerCase() === "sold" || String(vehicle.status).toLowerCase() === "sold") return res.status(404).json({ error: "This listing is no longer available." });
+    const row = normalizeMarketplaceInterest({ id, listingId, vehicleId, requesterClientId: clientId, name, phone, email, address, message, createdAt });
+    memoryMarketplaceInterests.unshift(row);
+    return res.status(201).json(serializeMarketplaceInterest(row));
+  }
+  await ensureMarketplaceInterestsTable();
+  const [rows] = await pool.query(
+    `SELECT l.id, l.vehicle_id, l.status, v.status AS vehicle_status FROM listings l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.id = ? AND v.id = ? LIMIT 1`,
+    [listingId, vehicleId]
+  );
+  if (!rows.length || ["sold", "disabled", "rejected"].includes(String(rows[0].status || "").toLowerCase()) || String(rows[0].vehicle_status || "").toLowerCase() === "sold") {
+    return res.status(404).json({ error: "This listing is no longer available." });
+  }
+  await pool.query(
+    `INSERT INTO marketplace_interest_requests (id, listing_id, vehicle_id, requester_client_id, name, phone, email, address, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, listingId, vehicleId, clientId, name, phone, email, address, message, createdAt]
+  );
+  const [saved] = await pool.query("SELECT * FROM marketplace_interest_requests WHERE id = ?", [id]);
+  res.status(201).json(serializeMarketplaceInterest(saved[0]));
+}));
+
+app.get("/api/marketplace-interests", asyncHandler(async (req, res) => {
+  if (!isAdminRequest(req)) return res.status(403).json({ error: "Only admins can view marketplace interest requests." });
+  await pingDb();
+  if (!dbAvailable) return res.json(memoryMarketplaceInterests.map(serializeMarketplaceInterest));
+  await ensureMarketplaceInterestsTable();
+  const [rows] = await pool.query(
+    `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration
+     FROM marketplace_interest_requests i
+     LEFT JOIN listings l ON l.id = i.listing_id
+     LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     ORDER BY i.created_at DESC`
+  );
+  res.json(rows.map(serializeMarketplaceInterest));
+}));
+
 app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
   const adminRequest = isAdminRequest(req);
   if (!isCustomerRequest(req) && !adminRequest) return res.status(403).json({ error: "Only the listing owner or an admin can delete a listing." });
@@ -3096,6 +3220,7 @@ app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
     const index = memoryListings.findIndex((item) => item.id === listingId);
     memoryListings.splice(index, 1);
     memorySaleClosings.splice(0, memorySaleClosings.length, ...memorySaleClosings.filter((item) => item.listing_id !== listingId));
+    memoryMarketplaceInterests.splice(0, memoryMarketplaceInterests.length, ...memoryMarketplaceInterests.filter((item) => item.listing_id !== listingId));
     memoryMarketplaceThreads.splice(0, memoryMarketplaceThreads.length, ...memoryMarketplaceThreads.filter((item) => item.listing_id !== listingId));
     return res.json({ ok: true, id: listingId });
   }
@@ -3106,6 +3231,10 @@ app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
   );
   if (!rows.length) return res.status(404).json({ error: "Listing not found or not owned by this account." });
   if (String(rows[0].status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
+  if (dbAvailable) {
+    await ensureMarketplaceInterestsTable();
+    await pool.query("DELETE FROM marketplace_interest_requests WHERE listing_id = ?", [listingId]);
+  }
   await pool.query("DELETE FROM listings WHERE id = ?", [listingId]);
   await pool.query("UPDATE vehicles SET status = 'Active', sold_date = NULL WHERE id = ? AND status = 'Listed'", [rows[0].vehicle_id]);
   res.json({ ok: true, id: listingId });

@@ -590,7 +590,33 @@ function serializeSaleClosing(row) {
   };
 }
 
+function marketplaceInterestInitialMessage(row) {
+  const createdAt = row.createdAt || row.created_at || new Date().toISOString();
+  const name = String(row.name || "Customer").trim();
+  const phone = String(row.phone || row.number || "").trim();
+  const email = String(row.email || "").trim();
+  const address = String(row.address || "").trim();
+  const message = String(row.message || "").trim();
+  return {
+    id: `m-${String(row.id || Date.now())}`,
+    senderId: String(row.requesterClientId || row.requester_client_id || ""),
+    senderRole: "Customer",
+    senderName: name,
+    text: `Name: ${name}\nNumber: ${phone}\nEmail: ${email}\nAddress: ${address}\nMessage: ${message}`,
+    sentAt: createdAt
+  };
+}
+
 function normalizeMarketplaceInterest(row) {
+  let messages = row.messages || row.messages_json || [];
+  if (typeof messages === "string") {
+    try {
+      messages = JSON.parse(messages || "[]");
+    } catch {
+      messages = [];
+    }
+  }
+  if (!messages.length && row.name) messages = [marketplaceInterestInitialMessage(row)];
   return {
     id: String(row.id || `mi-${Date.now()}`),
     listing_id: String(row.listingId || row.listing_id || ""),
@@ -601,11 +627,15 @@ function normalizeMarketplaceInterest(row) {
     email: String(row.email || "").trim(),
     address: String(row.address || "").trim(),
     message: String(row.message || "").trim(),
+    messages: Array.isArray(messages) ? messages : [],
     created_at: row.createdAt || row.created_at || new Date().toISOString()
   };
 }
 
 function serializeMarketplaceInterest(row) {
+  const messages = Array.isArray(row.messages) && row.messages.length
+    ? row.messages
+    : (row.name ? [marketplaceInterestInitialMessage(row)] : []);
   return {
     id: row.id,
     listingId: row.listing_id,
@@ -616,6 +646,7 @@ function serializeMarketplaceInterest(row) {
     email: row.email || "",
     address: row.address || "",
     message: row.message || "",
+    messages,
     listingTitle: row.listing_title || "",
     listingLocation: row.listing_location || "",
     registration: row.registration || "",
@@ -1779,6 +1810,7 @@ async function ensureMarketplaceInterestsTable(conn = null) {
       email VARCHAR(190) NOT NULL,
       address TEXT NOT NULL,
       message TEXT NOT NULL,
+      messages_json JSON,
       created_at VARCHAR(64),
       INDEX idx_marketplace_interest_listing (listing_id),
       INDEX idx_marketplace_interest_client (requester_client_id),
@@ -1786,6 +1818,9 @@ async function ensureMarketplaceInterestsTable(conn = null) {
       FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
     )`
   );
+  const [columns] = await query("SHOW COLUMNS FROM marketplace_interest_requests");
+  const columnNames = new Set(columns.map((column) => column.Field));
+  if (!columnNames.has("messages_json")) await query("ALTER TABLE marketplace_interest_requests ADD COLUMN messages_json JSON NULL");
   marketplaceInterestsReady = true;
 }
 
@@ -3166,12 +3201,16 @@ app.post("/api/marketplace-interests", asyncHandler(async (req, res) => {
   await pingDb();
   const id = `mi-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
   const createdAt = new Date().toISOString();
-  const clientId = String(req.auth.clientId || "");
+  const memoryAllowed = isCustomerRequest(req) ? memoryClientIdsForRequest(req) : new Set();
+  let clientId = String(req.auth.clientId || "");
+  if (!clientId && !dbAvailable) clientId = [...memoryAllowed][0] || "";
+  if (!clientId && dbAvailable) clientId = (await mysqlClientIdsForRequest(req))[0] || "";
+  const initialMessage = marketplaceInterestInitialMessage({ id, requesterClientId: clientId, name, phone, email, address, message, createdAt });
   if (!dbAvailable) {
     const listing = memoryListings.find((item) => item.id === listingId && item.vehicle_id === vehicleId);
     const vehicle = memoryVehicles.find((item) => item.id === vehicleId);
     if (!listing || !vehicle || String(listing.status).toLowerCase() === "sold" || String(vehicle.status).toLowerCase() === "sold") return res.status(404).json({ error: "This listing is no longer available." });
-    const row = normalizeMarketplaceInterest({ id, listingId, vehicleId, requesterClientId: clientId, name, phone, email, address, message, createdAt });
+    const row = normalizeMarketplaceInterest({ id, listingId, vehicleId, requesterClientId: clientId, name, phone, email, address, message, createdAt, messages: [initialMessage] });
     memoryMarketplaceInterests.unshift(row);
     return res.status(201).json(serializeMarketplaceInterest(row));
   }
@@ -3184,26 +3223,86 @@ app.post("/api/marketplace-interests", asyncHandler(async (req, res) => {
     return res.status(404).json({ error: "This listing is no longer available." });
   }
   await pool.query(
-    `INSERT INTO marketplace_interest_requests (id, listing_id, vehicle_id, requester_client_id, name, phone, email, address, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, listingId, vehicleId, clientId, name, phone, email, address, message, createdAt]
+    `INSERT INTO marketplace_interest_requests (id, listing_id, vehicle_id, requester_client_id, name, phone, email, address, message, messages_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, listingId, vehicleId, clientId, name, phone, email, address, message, JSON.stringify([initialMessage]), createdAt]
   );
   const [saved] = await pool.query("SELECT * FROM marketplace_interest_requests WHERE id = ?", [id]);
   res.status(201).json(serializeMarketplaceInterest(saved[0]));
 }));
 
 app.get("/api/marketplace-interests", asyncHandler(async (req, res) => {
-  if (!isAdminRequest(req)) return res.status(403).json({ error: "Only admins can view marketplace interest requests." });
+  if (!isAdminRequest(req) && !isCustomerRequest(req)) return res.status(403).json({ error: "Only the interested customer or an admin can view this chat." });
   await pingDb();
-  if (!dbAvailable) return res.json(memoryMarketplaceInterests.map(serializeMarketplaceInterest));
+  const allowedClientIds = isAdminRequest(req)
+    ? null
+    : (dbAvailable ? new Set(await mysqlClientIdsForRequest(req)) : memoryClientIdsForRequest(req));
+  if (!dbAvailable) {
+    return res.json(memoryMarketplaceInterests
+      .filter((item) => !allowedClientIds || allowedClientIds.has(item.requester_client_id))
+      .map(serializeMarketplaceInterest));
+  }
   await ensureMarketplaceInterestsTable();
+  const scope = allowedClientIds ? [...allowedClientIds] : [];
+  if (allowedClientIds && scope.length === 0) return res.json([]);
   const [rows] = await pool.query(
     `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration
      FROM marketplace_interest_requests i
      LEFT JOIN listings l ON l.id = i.listing_id
      LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     ${allowedClientIds ? `WHERE i.requester_client_id IN (${scope.map(() => "?").join(",")})` : ""}
      ORDER BY i.created_at DESC`
+    , allowedClientIds ? scope : []
   );
   res.json(rows.map(serializeMarketplaceInterest));
+}));
+
+app.post("/api/marketplace-interests/:id/messages", asyncHandler(async (req, res) => {
+  if (!isAdminRequest(req) && !isCustomerRequest(req)) return res.status(403).json({ error: "Only the interested customer or an admin can chat here." });
+  const interestId = String(req.params.id || "").trim();
+  const text = String(req.body?.text || "").trim().slice(0, 4000);
+  if (!interestId || !text) return res.status(400).json({ error: "A chat message is required." });
+  await pingDb();
+  const allowedClientIds = isAdminRequest(req)
+    ? null
+    : (dbAvailable ? new Set(await mysqlClientIdsForRequest(req)) : memoryClientIdsForRequest(req));
+  const canAccess = (row) => Boolean(row && (!allowedClientIds || allowedClientIds.has(String(row.requester_client_id || row.requesterClientId || ""))));
+  const now = new Date().toISOString();
+  const message = {
+    id: String(req.body?.messageId || `m-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`),
+    senderId: String(req.auth.userId || ""),
+    senderRole: String(req.auth.role || ""),
+    senderName: isAdminRequest(req) ? "Admin" : String(req.auth.name || "Customer"),
+    text,
+    sentAt: now
+  };
+  if (!dbAvailable) {
+    const row = memoryMarketplaceInterests.find((item) => item.id === interestId);
+    if (!canAccess(row)) return res.status(404).json({ error: "Interest chat not found." });
+    row.messages = [...(Array.isArray(row.messages) ? row.messages : []), message];
+    row.created_at = now;
+    return res.json(serializeMarketplaceInterest(row));
+  }
+  await ensureMarketplaceInterestsTable();
+  const [rows] = await pool.query("SELECT * FROM marketplace_interest_requests WHERE id = ? LIMIT 1", [interestId]);
+  const row = rows[0];
+  if (!canAccess(row)) return res.status(404).json({ error: "Interest chat not found." });
+  let messages = row.messages_json || [];
+  if (typeof messages === "string") {
+    try { messages = JSON.parse(messages || "[]"); } catch { messages = []; }
+  }
+  if (!Array.isArray(messages)) messages = [];
+  if (!messages.length) messages.push(marketplaceInterestInitialMessage(row));
+  messages.push(message);
+  await pool.query("UPDATE marketplace_interest_requests SET messages_json = ?, created_at = ? WHERE id = ?", [JSON.stringify(messages), now, interestId]);
+  const [saved] = await pool.query(
+    `SELECT i.*, l.title AS listing_title, l.location AS listing_location, v.reg_no AS registration
+     FROM marketplace_interest_requests i
+     LEFT JOIN listings l ON l.id = i.listing_id
+     LEFT JOIN vehicles v ON v.id = i.vehicle_id
+     WHERE i.id = ? LIMIT 1`,
+    [interestId]
+  );
+  res.json(serializeMarketplaceInterest(saved[0]));
 }));
 
 app.delete("/api/listings/:id", asyncHandler(async (req, res) => {

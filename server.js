@@ -412,6 +412,38 @@ function normalizeDue(row) {
   };
 }
 
+function normalizeListingPhoto(value, index) {
+  if (!value) return null;
+  if (typeof value === "string") {
+    const dataUrl = value.startsWith("data:") || value.startsWith("file:") || value.startsWith("content:") || value.startsWith("blob:") || value.startsWith("http")
+      ? value
+      : `data:image/jpeg;base64,${value}`;
+    return {
+      id: `lp-${index}-${Buffer.from(value).toString("base64url").slice(0, 12)}`,
+      fileName: `vehicle-photo-${index + 1}.jpg`,
+      mimeType: "image/jpeg",
+      size: 0,
+      dataUrl,
+      uploadedAt: new Date().toISOString()
+    };
+  }
+  if (typeof value !== "object") return null;
+  const mimeType = String(value.mimeType || value.mime_type || "image/jpeg");
+  const source = value.dataUrl || value.data_url || value.uri || value.url || value.base64 || "";
+  if (!source) return null;
+  const dataUrl = String(source).startsWith("data:") || String(source).startsWith("file:") || String(source).startsWith("content:") || String(source).startsWith("blob:") || String(source).startsWith("http")
+    ? String(source)
+    : `data:${mimeType};base64,${source}`;
+  return {
+    id: String(value.id || `lp-${index}-${Date.now()}`),
+    fileName: String(value.fileName || value.file_name || `vehicle-photo-${index + 1}.jpg`),
+    mimeType,
+    size: Number(value.size || value.size_bytes || 0),
+    dataUrl,
+    uploadedAt: value.uploadedAt || value.uploaded_at || new Date().toISOString()
+  };
+}
+
 function normalizeListing(row) {
   let photos = row.photos || row.photos_json || [];
   if (typeof photos === "string") {
@@ -425,11 +457,16 @@ function normalizeListing(row) {
     id: String(row.id || `m-${Date.now()}`),
     vehicle_id: row.vehicleId || row.vehicle_id || "",
     title: row.title || "",
+    is_owner: Boolean(row.isOwner ?? row.is_owner),
+    registration_no: row.registrationNo || row.registration_no || row.registration || row.reg_no || "",
+    vehicle_type: row.vehicleType || row.vehicle_type || row.asset_type || "",
+    vehicle_make: row.vehicleMake || row.vehicle_make || "",
+    vehicle_model: row.vehicleModel || row.vehicle_model || "",
     price: Number(row.price || 0),
     location: row.location || "",
     status: row.status || "Submitted",
     condition_note: row.condition || row.condition_note || "Good",
-    photos: Array.isArray(photos) ? photos : [],
+    photos: Array.isArray(photos) ? photos.map(normalizeListingPhoto).filter(Boolean) : [],
     createdAt: row.createdAt || row.created_at || ""
   };
 }
@@ -2985,36 +3022,84 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
         : listing;
       const closing = memorySaleClosings.find((item) => item.listing_id === listing.id);
       return isPublicMarketplaceListing(effectiveListing, effectiveVehicle, closing);
+    }).map((listing) => {
+      const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
+      return normalizeListing({
+        ...listing,
+        is_owner: Boolean(vehicle && allowed.has(vehicle.client_id)),
+        registration: vehicle?.reg_no || "",
+        asset_type: vehicle?.type || "",
+        vehicle_make: vehicle?.make || "",
+        vehicle_model: vehicle?.model || ""
+      });
     }));
     return res.json((allowed ? memoryListings.filter((listing) => {
       const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
       return ["Active", "Reserved"].includes(listing.status) || (vehicle && allowed.has(vehicle.client_id));
-    }) : memoryListings));
+    }) : memoryListings).map((listing) => {
+      const vehicle = memoryVehicles.find((item) => item.id === listing.vehicle_id);
+      return normalizeListing({
+        ...listing,
+        is_owner: Boolean(vehicle && allowed?.has(vehicle.client_id)),
+        registration: vehicle?.reg_no || "",
+        asset_type: vehicle?.type || "",
+        vehicle_make: vehicle?.make || "",
+        vehicle_model: vehicle?.model || ""
+      });
+    }));
   }
   const allowed = await mysqlClientIdsForRequest(req);
   if (req.auth.role === "Caller") return res.json([]);
   if (isCustomerRequest(req)) {
     await ensureSaleClosingsTable();
     const [rows] = await pool.query(
-      "SELECT l.* FROM listings l " +
+      "SELECT l.*, v.client_id AS listing_client_id, v.reg_no AS registration, v.type AS asset_type, v.make AS vehicle_make, v.model AS vehicle_model FROM listings l " +
       "JOIN vehicles v ON v.id = l.vehicle_id " +
       "WHERE (LOWER(TRIM(l.status)) NOT IN ('sold', 'rejected', 'disabled', 'changes required') " +
       "OR (LOWER(TRIM(l.status)) = 'sold' AND NOT EXISTS (SELECT 1 FROM sale_closings sc0 WHERE sc0.listing_id = l.id AND sc0.status = 'Sold'))) " +
       "AND (v.status IS NULL OR v.status <> 'Sold' OR NOT EXISTS (SELECT 1 FROM sale_closings sc1 WHERE sc1.vehicle_id = v.id AND sc1.status = 'Sold')) " +
       "AND NOT EXISTS (SELECT 1 FROM sale_closings sc WHERE sc.listing_id = l.id AND sc.status = 'Sold')"
     );
-    return res.json(rows.map((row) => normalizeListing({ ...row, status: String(row.status || "").toLowerCase() === "sold" ? "Active" : row.status })));
+    return res.json(rows.map((row) => normalizeListing({ ...row, is_owner: allowed.has(row.listing_client_id), status: String(row.status || "").toLowerCase() === "sold" ? "Active" : row.status })));
   }
   const scope = allowed ? sqlScope(allowed, "v.client_id") : null;
   const [rows] = await pool.query(
-    `SELECT l.* FROM listings l JOIN vehicles v ON v.id = l.vehicle_id
+    `SELECT l.*, v.client_id AS listing_client_id, v.reg_no AS registration, v.type AS asset_type, v.make AS vehicle_make, v.model AS vehicle_model FROM listings l JOIN vehicles v ON v.id = l.vehicle_id
      ${scope ? `WHERE l.status IN ('Active', 'Reserved') OR ${scope.clause}` : ""}`,
     scope?.params || []
   );
-  res.json(rows.map(normalizeListing));
+  res.json(rows.map((row) => normalizeListing({ ...row, is_owner: Boolean(allowed?.has(row.listing_client_id)) })));
 }));
 
 // ─── Caller Activities ──────────────────────────────────
+app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Only the listing owner can delete a listing." });
+  await pingDb();
+  const listingId = String(req.params.id || "");
+  const allowed = new Set(dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)]);
+  if (!dbAvailable) {
+    const listing = memoryListings.find((item) => item.id === listingId);
+    const vehicle = listing ? memoryVehicles.find((item) => item.id === listing.vehicle_id) : null;
+    if (!listing || !vehicle || !allowed.has(vehicle.client_id)) return res.status(404).json({ error: "Listing not found or not owned by this account." });
+    if (String(listing.status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
+    const index = memoryListings.findIndex((item) => item.id === listingId);
+    memoryListings.splice(index, 1);
+    memorySaleClosings.splice(0, memorySaleClosings.length, ...memorySaleClosings.filter((item) => item.listing_id !== listingId));
+    memoryMarketplaceThreads.splice(0, memoryMarketplaceThreads.length, ...memoryMarketplaceThreads.filter((item) => item.listing_id !== listingId));
+    return res.json({ ok: true, id: listingId });
+  }
+  const scope = sqlScope([...allowed], "v.client_id");
+  const [rows] = await pool.query(
+    `SELECT l.id, l.vehicle_id, l.status FROM listings l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.id = ? AND ${scope.clause} LIMIT 1`,
+    [listingId, ...scope.params]
+  );
+  if (!rows.length) return res.status(404).json({ error: "Listing not found or not owned by this account." });
+  if (String(rows[0].status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
+  await pool.query("DELETE FROM listings WHERE id = ?", [listingId]);
+  await pool.query("UPDATE vehicles SET status = 'Active', sold_date = NULL WHERE id = ? AND status = 'Listed'", [rows[0].vehicle_id]);
+  res.json({ ok: true, id: listingId });
+}));
+
 app.get("/api/caller-activities", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {

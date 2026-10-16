@@ -561,6 +561,8 @@ function normalizeSaleClosing(row) {
     bank_noc: normalizeSaleClosingFile(row.bankNoc || row.bank_noc),
     ownership_transfer: normalizeSaleClosingFile(row.ownershipTransfer || row.ownership_transfer),
     sold_date: row.soldDate || row.sold_date || "",
+    buyer_name: String(row.buyerName || row.buyer_name || "").trim(),
+    sold_type: String(row.soldType || row.sold_type || "").trim(),
     status,
     updated_at: row.updatedAt || row.updated_at || new Date().toISOString()
   };
@@ -578,6 +580,8 @@ function serializeSaleClosing(row) {
     bankNoc: row.bank_noc || null,
     ownershipTransfer: row.ownership_transfer || null,
     soldDate: row.sold_date || "",
+    buyerName: row.buyer_name || "",
+    soldType: row.sold_type || "",
     status: row.status || "Estimated",
     updatedAt: row.updated_at || ""
   };
@@ -1698,6 +1702,8 @@ async function ensureSaleClosingsTable(conn = null) {
       bank_noc_json JSON,
       ownership_transfer_json JSON,
       sold_date DATE NULL,
+      buyer_name VARCHAR(255) DEFAULT '',
+      sold_type VARCHAR(64) DEFAULT '',
       status VARCHAR(32) DEFAULT 'Estimated',
       updated_at VARCHAR(64),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1707,6 +1713,10 @@ async function ensureSaleClosingsTable(conn = null) {
       FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
     )`
   );
+  const [columns] = await query("SHOW COLUMNS FROM sale_closings");
+  const columnNames = new Set(columns.map((column) => column.Field));
+  if (!columnNames.has("buyer_name")) await query("ALTER TABLE sale_closings ADD COLUMN buyer_name VARCHAR(255) DEFAULT ''");
+  if (!columnNames.has("sold_type")) await query("ALTER TABLE sale_closings ADD COLUMN sold_type VARCHAR(64) DEFAULT ''");
   saleClosingsReady = true;
 }
 
@@ -2088,9 +2098,9 @@ async function syncScopedData(req, payload) {
         }
         await conn.query(
           `REPLACE INTO sale_closings
-            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, status, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.status, closing.updated_at]
+            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, buyer_name, sold_type, status, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.buyer_name || "", closing.sold_type || "", closing.status, closing.updated_at]
         );
       }
       const threadIds = []; // General customer sync must not replace or delete chat history.
@@ -3073,14 +3083,15 @@ app.get("/api/listings", asyncHandler(async (req, res) => {
 
 // ─── Caller Activities ──────────────────────────────────
 app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
-  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Only the listing owner can delete a listing." });
+  const adminRequest = isAdminRequest(req);
+  if (!isCustomerRequest(req) && !adminRequest) return res.status(403).json({ error: "Only the listing owner or an admin can delete a listing." });
   await pingDb();
   const listingId = String(req.params.id || "");
-  const allowed = new Set(dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)]);
+  const allowed = adminRequest ? null : new Set(dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)]);
   if (!dbAvailable) {
     const listing = memoryListings.find((item) => item.id === listingId);
     const vehicle = listing ? memoryVehicles.find((item) => item.id === listing.vehicle_id) : null;
-    if (!listing || !vehicle || !allowed.has(vehicle.client_id)) return res.status(404).json({ error: "Listing not found or not owned by this account." });
+    if (!listing || !vehicle || (allowed && !allowed.has(vehicle.client_id))) return res.status(404).json({ error: "Listing not found or not owned by this account." });
     if (String(listing.status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
     const index = memoryListings.findIndex((item) => item.id === listingId);
     memoryListings.splice(index, 1);
@@ -3088,10 +3099,10 @@ app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
     memoryMarketplaceThreads.splice(0, memoryMarketplaceThreads.length, ...memoryMarketplaceThreads.filter((item) => item.listing_id !== listingId));
     return res.json({ ok: true, id: listingId });
   }
-  const scope = sqlScope([...allowed], "v.client_id");
+  const scope = allowed ? sqlScope([...allowed], "v.client_id") : null;
   const [rows] = await pool.query(
-    `SELECT l.id, l.vehicle_id, l.status FROM listings l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.id = ? AND ${scope.clause} LIMIT 1`,
-    [listingId, ...scope.params]
+    `SELECT l.id, l.vehicle_id, l.status FROM listings l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.id = ? ${scope ? `AND ${scope.clause}` : ""} LIMIT 1`,
+    [listingId, ...(scope?.params || [])]
   );
   if (!rows.length) return res.status(404).json({ error: "Listing not found or not owned by this account." });
   if (String(rows[0].status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
@@ -3627,9 +3638,9 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
       for (const closing of saleClosings) {
         await conn.query(
           `REPLACE INTO sale_closings
-            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, status, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.status, closing.updated_at]
+            (id, listing_id, vehicle_id, client_id, estimated_amount, bank_confirmed_amount, foreclosure_json, bank_noc_json, ownership_transfer_json, sold_date, buyer_name, sold_type, status, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [closing.id, closing.listing_id, closing.vehicle_id, closing.client_id, closing.estimated_amount, closing.bank_confirmed_amount, JSON.stringify(closing.foreclosure_statement), JSON.stringify(closing.bank_noc), JSON.stringify(closing.ownership_transfer), closing.sold_date || null, closing.buyer_name || "", closing.sold_type || "", closing.status, closing.updated_at]
         );
       }
     }

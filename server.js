@@ -630,54 +630,81 @@ function marketplaceMoney(value) {
   return `INR ${Number.isFinite(amount) ? new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(amount) : "0"}`;
 }
 
+function marketplaceFinanceStatus(vehicle) {
+  const tenure = Number(vehicle?.tenure || 0);
+  const paidEmi = Number(vehicle?.paid_emi || 0);
+  if (tenure > 0 && paidEmi >= tenure) return "Closed";
+  if (Number(vehicle?.loan_amount || 0) > 0 || Number(vehicle?.emi_amount || 0) > 0 || Number(vehicle?.principal || 0) > 0) return "Financed";
+  return "Not financed";
+}
+
+function normalizeMarketplaceApprovalMessage(text) {
+  let lines = String(text || "").split(/\r?\n/);
+  lines = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (/^Trailer (PUC|insurance|permit|fitness)/i.test(trimmed)) return false;
+    return !/^(PUC|Insurance|Permit|Fitness)[^:]*:\s*-\s*$/i.test(trimmed);
+  });
+  const addStatus = (statusLabel, paidPattern, tenurePattern, afterPattern) => {
+    if (lines.some((line) => line.toLowerCase().startsWith(statusLabel.toLowerCase()))) return;
+    const paidLine = lines.find((line) => paidPattern.test(line));
+    const tenureLine = lines.find((line) => tenurePattern.test(line));
+    const paid = Number(paidLine?.match(/(\d+)\s*$/)?.[1] || 0);
+    const tenure = Number(tenureLine?.match(/(\d+)\s*$/)?.[1] || 0);
+    if (!paidLine || !tenureLine) return;
+    const status = tenure > 0 && paid >= tenure ? "Closed" : "Financed";
+    const afterIndex = lines.findIndex((line) => afterPattern.test(line));
+    if (afterIndex >= 0) lines.splice(afterIndex + 1, 0, `${statusLabel}: ${status}`);
+  };
+  addStatus("EMI status", /^EMI paid:/i, /^Total tenure:/i, /^Registration:/i);
+  addStatus("Trailer EMI status", /^Trailer EMI paid:/i, /^Trailer total tenure:/i, /^Trailer model:/i);
+  return lines.join("\n");
+}
+
 function marketplaceVehicleDetailsMessage(listing, vehicle, trailer = null) {
   const paidEmi = Number(vehicle.paid_emi || 0);
   const tenure = Number(vehicle.tenure || 0);
   const remainingEmi = Math.max(tenure - paidEmi, 0);
-  const value = (item) => item === null || item === undefined || item === "" ? "-" : String(item);
+  const addIfPresent = (lines, label, item) => {
+    if (item !== null && item !== undefined && String(item).trim() !== "") lines.push(`${label}: ${item}`);
+  };
   const lines = [
     "ADMIN APPROVED VEHICLE DETAILS",
-    `Vehicle: ${value(listing?.title || vehicle?.model || vehicle?.reg_no)}`,
-    `Registration: ${value(vehicle?.reg_no)}`,
-    `Location: ${value(listing?.location)}`,
+    `Vehicle: ${listing?.title || vehicle?.model || vehicle?.reg_no || "-"}`,
+    `Registration: ${vehicle?.reg_no || "-"}`,
+    `EMI status: ${marketplaceFinanceStatus(vehicle)}`,
+    ...(listing?.location ? [`Location: ${listing.location}`] : []),
     `Loan amount: ${marketplaceMoney(vehicle?.loan_amount)}`,
     `Closing principal: ${marketplaceMoney(vehicle?.principal)}`,
     `EMI amount: ${marketplaceMoney(vehicle?.emi_amount)}`,
     `EMI paid: ${paidEmi}`,
     `EMI remaining: ${remainingEmi}`,
-    `Total tenure: ${tenure || "-"}`,
-    `PUC number: ${value(vehicle?.puc_no)}`,
-    `PUC expiry: ${value(vehicle?.puc_expiry)}`,
-    `Insurance company: ${value(vehicle?.insurance_company)}`,
-    `Insurance policy number: ${value(vehicle?.insurance_policy_no)}`,
-    `Insurance expiry: ${value(vehicle?.insurance_expiry)}`,
-    `Permit number: ${value(vehicle?.permit_no)}`,
-    `Permit expiry: ${value(vehicle?.permit_expiry || vehicle?.national_permit_expiry)}`,
-    `Fitness expiry: ${value(vehicle?.fitness_expiry)}`
+    `Total tenure: ${tenure || "-"}`
   ];
+  addIfPresent(lines, "PUC number", vehicle?.puc_no);
+  addIfPresent(lines, "PUC expiry", vehicle?.puc_expiry);
+  addIfPresent(lines, "Insurance company", vehicle?.insurance_company);
+  addIfPresent(lines, "Insurance policy number", vehicle?.insurance_policy_no);
+  addIfPresent(lines, "Insurance expiry", vehicle?.insurance_expiry);
+  addIfPresent(lines, "Permit number", vehicle?.permit_no);
+  addIfPresent(lines, "Permit expiry", vehicle?.permit_expiry || vehicle?.national_permit_expiry);
+  addIfPresent(lines, "Fitness expiry", vehicle?.fitness_expiry);
   if (trailer) {
     const trailerPaidEmi = Number(trailer.paid_emi || 0);
     const trailerTenure = Number(trailer.tenure || 0);
     lines.push(
       "",
       "LINKED TRAILER DETAILS",
-      `Trailer registration: ${value(trailer.reg_no)}`,
-      `Trailer make: ${value(trailer.make)}`,
-      `Trailer model: ${value(trailer.model)}`,
+      `Trailer registration: ${trailer.reg_no || "-"}`,
+      `Trailer make: ${trailer.make || "-"}`,
+      `Trailer model: ${trailer.model || "-"}`,
+      `Trailer EMI status: ${marketplaceFinanceStatus(trailer)}`,
       `Trailer loan amount: ${marketplaceMoney(trailer.loan_amount)}`,
       `Trailer closing principal: ${marketplaceMoney(trailer.principal)}`,
       `Trailer EMI amount: ${marketplaceMoney(trailer.emi_amount)}`,
       `Trailer EMI paid: ${trailerPaidEmi}`,
       `Trailer EMI remaining: ${Math.max(trailerTenure - trailerPaidEmi, 0)}`,
-      `Trailer total tenure: ${trailerTenure || "-"}`,
-      `Trailer PUC number: ${value(trailer.puc_no)}`,
-      `Trailer PUC expiry: ${value(trailer.puc_expiry)}`,
-      `Trailer insurance company: ${value(trailer.insurance_company)}`,
-      `Trailer insurance policy number: ${value(trailer.insurance_policy_no)}`,
-      `Trailer insurance expiry: ${value(trailer.insurance_expiry)}`,
-      `Trailer permit number: ${value(trailer.permit_no)}`,
-      `Trailer permit expiry: ${value(trailer.permit_expiry || trailer.national_permit_expiry)}`,
-      `Trailer fitness expiry: ${value(trailer.fitness_expiry)}`
+      `Trailer total tenure: ${trailerTenure || "-"}`
     );
   }
   return lines.join("\n");
@@ -719,6 +746,9 @@ function serializeMarketplaceInterest(row) {
     }
   }
   if (!Array.isArray(messages) || !messages.length) messages = row.name ? [marketplaceInterestInitialMessage(row)] : [];
+  messages = messages.map((message) => /^ADMIN APPROVED VEHICLE DETAILS\b/i.test(String(message?.text || "").trim())
+    ? { ...message, kind: "vehicle-details", text: normalizeMarketplaceApprovalMessage(message.text) }
+    : message);
   return {
     id: row.id,
     listingId: row.listing_id,
@@ -3444,7 +3474,8 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
       && String(item.type || "").toLowerCase() === "trailer"
       && item.client_id === vehicle.client_id
       && String(item.reg_no || "").replace(/\s+body\b/i, "").trim().toLowerCase() === baseRegistration);
-    const messages = Array.isArray(interest.messages) && interest.messages.length ? interest.messages : [marketplaceInterestInitialMessage(interest)];
+    const messages = (Array.isArray(interest.messages) && interest.messages.length ? interest.messages : [marketplaceInterestInitialMessage(interest)])
+      .filter((message) => !/^ADMIN APPROVED VEHICLE DETAILS\b/i.test(String(message?.text || "").trim()));
     interest.messages = [...messages, approvalMessage(listing, vehicle, trailer)];
     interest.details_shared_at = now;
     return res.json(serializeMarketplaceInterest(interest));
@@ -3478,6 +3509,7 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
     try { messages = JSON.parse(messages || "[]"); } catch { messages = []; }
   }
   if (!Array.isArray(messages) || !messages.length) messages = [marketplaceInterestInitialMessage(interest)];
+  messages = messages.filter((message) => !/^ADMIN APPROVED VEHICLE DETAILS\b/i.test(String(message?.text || "").trim()));
   messages.push(approvalMessage({ title: interest.listing_title, location: interest.listing_location }, interest, trailer));
   await pool.query("UPDATE marketplace_interest_requests SET messages_json = ?, details_shared_at = ? WHERE id = ?", [JSON.stringify(messages), now, interestId]);
   const [saved] = await pool.query(
@@ -3495,18 +3527,19 @@ app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
   const adminRequest = isAdminRequest(req);
   if (!isCustomerRequest(req) && !adminRequest) return res.status(403).json({ error: "Only the listing owner or an admin can delete a listing." });
   await pingDb();
-  const listingId = String(req.params.id || "");
+  const listingId = String(req.params.id || "").trim();
+  const isListingMatch = (value) => String(value ?? "").trim() === listingId;
   const allowed = adminRequest ? null : new Set(dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)]);
   if (!dbAvailable) {
-    const listing = memoryListings.find((item) => item.id === listingId);
+    const listing = memoryListings.find((item) => isListingMatch(item.id));
     const vehicle = listing ? memoryVehicles.find((item) => item.id === listing.vehicle_id) : null;
     if (!listing || !vehicle || (allowed && !allowed.has(vehicle.client_id))) return res.status(404).json({ error: "Listing not found or not owned by this account." });
     if (String(listing.status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
-    const index = memoryListings.findIndex((item) => item.id === listingId);
+    const index = memoryListings.findIndex((item) => isListingMatch(item.id));
     memoryListings.splice(index, 1);
-    memorySaleClosings.splice(0, memorySaleClosings.length, ...memorySaleClosings.filter((item) => item.listing_id !== listingId));
-    memoryMarketplaceInterests.splice(0, memoryMarketplaceInterests.length, ...memoryMarketplaceInterests.filter((item) => item.listing_id !== listingId));
-    memoryMarketplaceThreads.splice(0, memoryMarketplaceThreads.length, ...memoryMarketplaceThreads.filter((item) => item.listing_id !== listingId));
+    memorySaleClosings.splice(0, memorySaleClosings.length, ...memorySaleClosings.filter((item) => !isListingMatch(item.listing_id)));
+    memoryMarketplaceInterests.splice(0, memoryMarketplaceInterests.length, ...memoryMarketplaceInterests.filter((item) => !isListingMatch(item.listing_id)));
+    memoryMarketplaceThreads.splice(0, memoryMarketplaceThreads.length, ...memoryMarketplaceThreads.filter((item) => !isListingMatch(item.listing_id)));
     return res.json({ ok: true, id: listingId });
   }
   const scope = allowed ? sqlScope([...allowed], "v.client_id") : null;
@@ -3516,13 +3549,30 @@ app.delete("/api/listings/:id", asyncHandler(async (req, res) => {
   );
   if (!rows.length) return res.status(404).json({ error: "Listing not found or not owned by this account." });
   if (String(rows[0].status || "").toLowerCase() === "sold") return res.status(409).json({ error: "Sold listings cannot be deleted." });
-  if (dbAvailable) {
-    await ensureMarketplaceInterestsTable();
-    await pool.query("DELETE FROM marketplace_interest_requests WHERE listing_id = ?", [listingId]);
+  // Remove only conversations attached to this exact listing. Do this
+  // explicitly instead of relying on a database cascade, because existing
+  // installations may have an older/incomplete foreign-key definition.
+  await ensureMarketplaceInterestsTable();
+  await ensureMarketplaceThreadsTable();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [interestResult] = await conn.query("DELETE FROM marketplace_interest_requests WHERE listing_id = ?", [listingId]);
+    const [threadResult] = await conn.query("DELETE FROM marketplace_threads WHERE listing_id = ?", [listingId]);
+    await conn.query("DELETE FROM listings WHERE id = ?", [listingId]);
+    await conn.query("UPDATE vehicles SET status = 'Active', sold_date = NULL WHERE id = ? AND status = 'Listed'", [rows[0].vehicle_id]);
+    await conn.commit();
+    res.json({
+      ok: true,
+      id: listingId,
+      deletedMarketplaceChats: Number(interestResult.affectedRows || 0) + Number(threadResult.affectedRows || 0)
+    });
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
   }
-  await pool.query("DELETE FROM listings WHERE id = ?", [listingId]);
-  await pool.query("UPDATE vehicles SET status = 'Active', sold_date = NULL WHERE id = ? AND status = 'Listed'", [rows[0].vehicle_id]);
-  res.json({ ok: true, id: listingId });
 }));
 
 app.get("/api/caller-activities", asyncHandler(async (req, res) => {

@@ -15,6 +15,37 @@ const DUE_MONITOR_ENABLED = process.env.DUE_MONITOR_ENABLED !== "false";
 const DUE_MONITOR_INTERVAL_HOURS = Math.max(1, Number(process.env.DUE_MONITOR_INTERVAL_HOURS || 24));
 const DUE_MONITOR_WINDOW_DAYS = Math.max(1, Number(process.env.DUE_MONITOR_WINDOW_DAYS || 30));
 const CALLER_ASSIGNMENT_MODE = process.env.CALLER_ASSIGNMENT_MODE || "permanent-client";
+
+// Lightweight in-process realtime bus. Every successful write request bumps
+// the sequence and wakes all connected clients waiting on /api/realtime. The
+// clients then fetch the authoritative scoped data from the database, so no
+// stale local snapshot is pushed between devices.
+let realtimeSequence = 0;
+const realtimeWaiters = new Set();
+
+function notifyRealtime(type = "data") {
+  realtimeSequence += 1;
+  const event = { sequence: realtimeSequence, type, at: new Date().toISOString() };
+  for (const waiter of [...realtimeWaiters]) {
+    realtimeWaiters.delete(waiter);
+    clearTimeout(waiter.timer);
+    waiter.resolve(event);
+  }
+}
+
+function waitForRealtime(since) {
+  if (realtimeSequence > since) {
+    return Promise.resolve({ sequence: realtimeSequence, type: "data", at: new Date().toISOString() });
+  }
+  return new Promise((resolve) => {
+    const waiter = { resolve, timer: null };
+    waiter.timer = setTimeout(() => {
+      realtimeWaiters.delete(waiter);
+      resolve(null);
+    }, 25000);
+    realtimeWaiters.add(waiter);
+  });
+}
 const databaseUrl = process.env.DATABASE_URL || process.env.MYSQL_URL || "";
 const databaseConfig = databaseUrl ? new URL(databaseUrl) : null;
 const dbSettings = {
@@ -1348,7 +1379,10 @@ async function runDueDateMonitoring(source = "manual") {
       ? await runMysqlDueDateMonitoring(source)
       : await runMemoryDueDateMonitoring(source);
     console.log(`[due-monitor] ${source}: created=${result.created}, updated=${result.updated}, scanned=${result.scanned}`);
-    await runCallerAssignment("due-monitor", CALLER_ASSIGNMENT_MODE);
+    const assignment = await runCallerAssignment("due-monitor", CALLER_ASSIGNMENT_MODE);
+    if (Number(result.created || 0) > 0 || Number(result.updated || 0) > 0 || Number(assignment?.assigned || 0) > 0) {
+      notifyRealtime("due-monitor");
+    }
     return result;
   } catch (error) {
     lastDueMonitorResult = { ...lastDueMonitorResult, ok: false, source, checkedAt: new Date().toISOString(), error: error?.message || String(error) };
@@ -2391,7 +2425,7 @@ app.use("/api", asyncHandler(async (req, res, next) => {
 }));
 
 app.use("/api", asyncHandler(async (req, res, next) => {
-  if (req.path === "/health" || req.path === "/login") return next();
+  if (req.path === "/health" || req.path === "/login" || req.path === "/realtime") return next();
   await pingDb();
   if (REQUIRE_DATABASE && !dbAvailable) {
     return res.status(503).json({
@@ -2408,6 +2442,29 @@ app.use("/api", asyncHandler(async (req, res, next) => {
     });
   }
   next();
+}));
+
+// Broadcast only after the write response succeeds. This covers every
+// create/update/delete endpoint, including marketplace approvals and chat
+// messages, without having to maintain a separate notification call in each
+// route.
+app.use("/api", (req, res, next) => {
+  const isWrite = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method);
+  if (isWrite && !["/health", "/login", "/realtime"].includes(req.path)) {
+    res.once("finish", () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) notifyRealtime(req.path);
+    });
+  }
+  next();
+});
+
+app.get("/api/realtime", asyncHandler(async (req, res) => {
+  const requestedSequence = Number(req.query.since);
+  const since = Number.isFinite(requestedSequence) && requestedSequence >= 0 ? requestedSequence : 0;
+  const event = await waitForRealtime(since);
+  res.set("Cache-Control", "no-store");
+  if (!event) return res.status(204).end();
+  res.json(event);
 }));
 
 // Health check

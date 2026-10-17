@@ -69,7 +69,13 @@ let whatsappTemplatesStore = null;
 const defaultReminderSettings = {
   enabled: DUE_MONITOR_ENABLED,
   intervalHours: DUE_MONITOR_INTERVAL_HOURS,
-  windowDays: DUE_MONITOR_WINDOW_DAYS
+  windowDays: DUE_MONITOR_WINDOW_DAYS,
+  emiWindowDays: 7,
+  pucWindowDays: 30,
+  insuranceWindowDays: 30,
+  fitnessWindowDays: 30,
+  permitWindowDays: 30,
+  nationalPermitWindowDays: 30
 };
 let reminderSettingsStore = { ...defaultReminderSettings };
 let dueMonitorTimer = null;
@@ -178,7 +184,18 @@ function sanitizeReminderSettings(input = {}) {
     : String(input.enabled ?? "true").toLowerCase() !== "false";
   const intervalHours = Math.min(168, Math.max(1, Math.round(Number(input.intervalHours ?? defaultReminderSettings.intervalHours) || defaultReminderSettings.intervalHours)));
   const windowDays = Math.min(180, Math.max(1, Math.round(Number(input.windowDays ?? defaultReminderSettings.windowDays) || defaultReminderSettings.windowDays)));
-  return { enabled, intervalHours, windowDays };
+  const days = (key) => Math.min(180, Math.max(1, Math.round(Number(input[key] ?? defaultReminderSettings[key]) || defaultReminderSettings[key])));
+  return {
+    enabled,
+    intervalHours,
+    windowDays,
+    emiWindowDays: days("emiWindowDays"),
+    pucWindowDays: days("pucWindowDays"),
+    insuranceWindowDays: days("insuranceWindowDays"),
+    fitnessWindowDays: days("fitnessWindowDays"),
+    permitWindowDays: days("permitWindowDays"),
+    nationalPermitWindowDays: days("nationalPermitWindowDays")
+  };
 }
 
 function currentReminderSettings() {
@@ -599,6 +616,7 @@ function marketplaceInterestInitialMessage(row) {
   const message = String(row.message || "").trim();
   return {
     id: `m-${String(row.id || Date.now())}`,
+    kind: "interest-request",
     senderId: String(row.requesterClientId || row.requester_client_id || ""),
     senderRole: "Customer",
     senderName: name,
@@ -999,11 +1017,13 @@ function deduplicateDueTasks(tasks) {
   return [...byKey.values()];
 }
 
-function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, amount = 0 }) {
+function buildDueCandidate({ clientId, vehicleId, type, date, callerId = null, amount = 0, windowKey = "" }) {
   const parsedDate = parseDueDate(date);
   if (!clientId || !vehicleId || !type || !parsedDate) return null;
   const days = daysUntil(parsedDate);
-  if (days === null || days > currentReminderSettings().windowDays) return null;
+  const settings = currentReminderSettings();
+  const windowDays = Number(settings[windowKey] ?? settings.windowDays) || settings.windowDays;
+  if (days === null || days > windowDays) return null;
   return {
     id: autoDueId(vehicleId, type, parsedDate),
     client_id: clientId,
@@ -1032,7 +1052,8 @@ function importRowDueCandidates(row, vehicle, client) {
       type: "EMI",
       date: entry.dueDate,
       callerId: client?.caller_id,
-      amount: Number(entry.amount || entry.installmentAmount || 0)
+      amount: Number(entry.amount || entry.installmentAmount || 0),
+      windowKey: "emiWindowDays"
     }))
     .filter(Boolean);
   const emiCandidates = scheduleDueCandidates.length > 0
@@ -1043,13 +1064,15 @@ function importRowDueCandidates(row, vehicle, client) {
         type: "EMI",
         date: row.emiEnd || row.emiStart,
         callerId: client?.caller_id,
-        amount: Number(String(row.emiAmount || "").replace(/\D/g, "")) || 0
+        amount: Number(String(row.emiAmount || "").replace(/\D/g, "")) || 0,
+        windowKey: "emiWindowDays"
       })].filter(Boolean);
   return [
-    buildDueCandidate({ clientId, vehicleId, type: "Insurance", date: row.policyEnd, callerId: client?.caller_id }),
-    buildDueCandidate({ clientId, vehicleId, type: "Permit", date: row.permitExpired || row.nationalPermitExpired, callerId: client?.caller_id }),
-    buildDueCandidate({ clientId, vehicleId, type: "Fitness", date: row.fitnessExpired, callerId: client?.caller_id }),
-    buildDueCandidate({ clientId, vehicleId, type: "PUC", date: row.pucExpired, callerId: client?.caller_id }),
+    buildDueCandidate({ clientId, vehicleId, type: "Insurance", date: row.policyEnd, callerId: client?.caller_id, windowKey: "insuranceWindowDays" }),
+    buildDueCandidate({ clientId, vehicleId, type: "Permit", date: row.permitExpired, callerId: client?.caller_id, windowKey: "permitWindowDays" }),
+    buildDueCandidate({ clientId, vehicleId, type: "Permit", date: row.nationalPermitExpired, callerId: client?.caller_id, windowKey: "nationalPermitWindowDays" }),
+    buildDueCandidate({ clientId, vehicleId, type: "Fitness", date: row.fitnessExpired, callerId: client?.caller_id, windowKey: "fitnessWindowDays" }),
+    buildDueCandidate({ clientId, vehicleId, type: "PUC", date: row.pucExpired, callerId: client?.caller_id, windowKey: "pucWindowDays" }),
     ...emiCandidates
   ].filter(Boolean);
 }
@@ -1089,9 +1112,12 @@ async function runMemoryDueDateMonitoring(source = "manual") {
 
   for (const vehicle of memoryVehicles) {
     const client = clientsById.get(vehicle.client_id);
-    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: client?.caller_id }));
-    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: client?.caller_id }));
-    scanned += 2;
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: client?.caller_id, windowKey: "insuranceWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: client?.caller_id, windowKey: "permitWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.national_permit_expiry, callerId: client?.caller_id, windowKey: "nationalPermitWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "PUC", date: vehicle.puc_expiry, callerId: client?.caller_id, windowKey: "pucWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Fitness", date: vehicle.fitness_expiry, callerId: client?.caller_id, windowKey: "fitnessWindowDays" }));
+    scanned += 5;
   }
 
   for (const item of memoryClientImports) {
@@ -1183,9 +1209,12 @@ async function runMysqlDueDateMonitoring(source = "manual") {
   let updated = 0;
 
   for (const vehicle of vehicles) {
-    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: vehicle.caller_id }));
-    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: vehicle.caller_id }));
-    scanned += 2;
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Insurance", date: vehicle.insurance_expiry, callerId: vehicle.caller_id, windowKey: "insuranceWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.permit_expiry, callerId: vehicle.caller_id, windowKey: "permitWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Permit", date: vehicle.national_permit_expiry, callerId: vehicle.caller_id, windowKey: "nationalPermitWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "PUC", date: vehicle.puc_expiry, callerId: vehicle.caller_id, windowKey: "pucWindowDays" }));
+    candidates.push(buildDueCandidate({ clientId: vehicle.client_id, vehicleId: vehicle.id, type: "Fitness", date: vehicle.fitness_expiry, callerId: vehicle.caller_id, windowKey: "fitnessWindowDays" }));
+    scanned += 5;
   }
 
   for (const item of imports) {
@@ -2520,6 +2549,13 @@ app.get("/api/reminder-settings", asyncHandler(async (req, res) => {
   res.json(currentReminderSettings());
 }));
 
+// Alert windows are safe to expose to authenticated customer apps because
+// they contain timing rules only, never admin credentials or permissions.
+app.get("/api/reminder-settings/public", asyncHandler(async (req, res) => {
+  await loadReminderSettingsFromDatabase();
+  res.json(currentReminderSettings());
+}));
+
 app.put("/api/reminder-settings", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
   const nextSettings = sanitizeReminderSettings(req.body || {});
@@ -3346,6 +3382,7 @@ app.post("/api/marketplace-interests/:id/messages", asyncHandler(async (req, res
   const now = new Date().toISOString();
   const message = {
     id: String(req.body?.messageId || `m-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`),
+    kind: "chat",
     senderId: String(req.auth.userId || ""),
     senderRole: String(req.auth.role || ""),
     senderName: isAdminRequest(req) ? "Admin" : String(req.auth.name || "Customer"),
@@ -3390,6 +3427,7 @@ app.post("/api/marketplace-interests/:id/approve", asyncHandler(async (req, res)
   const now = new Date().toISOString();
   const approvalMessage = (listing, vehicle, trailer) => ({
     id: `m-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`,
+    kind: "vehicle-details",
     senderId: String(req.auth.userId || ""),
     senderRole: "Admin",
     senderName: "Admin",

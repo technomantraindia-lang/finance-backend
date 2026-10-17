@@ -137,7 +137,17 @@ const SESSION_TTL_MS = Math.max(15 * 60 * 1000, Number(process.env.SESSION_TTL_H
 // backend instances. Set SESSION_SECRET to one stable production secret.
 const SESSION_SECRET = process.env.SESSION_SECRET || process.env.DB_PASSWORD || "kuber-finance-session-secret";
 
-app.use(cors());
+// The web console and mobile app send Authorization + JSON headers, which
+// triggers a browser OPTIONS preflight. Reflect the requesting app origin and
+// answer OPTIONS before authentication middleware gets involved.
+const corsOptions = {
+  origin: true,
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control"],
+  optionsSuccessStatus: 204
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "25mb" }));
 
 app.get("/privacy-policy", (req, res) => {

@@ -904,6 +904,7 @@ function normalizeSubscriptionPlan(row) {
     maxVehicles: Math.max(1, Math.round(Number(row.maxVehicles ?? row.max_vehicles ?? 1) || 1)),
     features: rawFeatures.map((feature) => String(feature || "").trim().slice(0, 160)).filter(Boolean).slice(0, 20),
     status,
+    customerCount: Math.max(0, Number(row.customerCount ?? row.customer_count ?? 0) || 0),
     createdBy: row.createdBy ?? row.created_by ?? null,
     createdAt: row.createdAt ?? row.created_at ?? null,
     updatedAt: row.updatedAt ?? row.updated_at ?? null
@@ -2921,8 +2922,19 @@ app.get("/api/subscription-plans", asyncHandler(async (req, res) => {
     return res.json(rows.map(normalizeSubscriptionPlan));
   }
   if (denyUnlessAdmin(req, res)) return;
-  if (!dbAvailable) return res.json(memorySubscriptionPlans.map(normalizeSubscriptionPlan));
-  const [rows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at DESC, name ASC");
+  if (!dbAvailable) {
+    return res.json(memorySubscriptionPlans.map((plan) => normalizeSubscriptionPlan({
+      ...plan,
+      customerCount: memoryClients.filter((client) => client.subscription_plan_id === plan.id).length
+    })));
+  }
+  const [rows] = await pool.query(
+    `SELECT p.*, COUNT(c.id) AS customer_count
+     FROM subscription_plans p
+     LEFT JOIN clients c ON c.subscription_plan_id = p.id
+     GROUP BY p.id
+     ORDER BY p.created_at DESC, p.name ASC`
+  );
   res.json(rows.map(normalizeSubscriptionPlan));
 }));
 

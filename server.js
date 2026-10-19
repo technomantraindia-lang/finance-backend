@@ -205,6 +205,7 @@ const memorySaleClosings = [];
 const memoryMarketplaceInterests = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
+const memorySubscriptionPlans = [];
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -363,7 +364,8 @@ function normalizeClient(row) {
     city: row.city || "",
     phone: row.phone || "",
     caller_id: row.callerId || row.caller_id || null,
-    email: String(row.email || row.loginEmail || "").trim().toLowerCase()
+    email: String(row.email || row.loginEmail || "").trim().toLowerCase(),
+    subscription_plan_id: String(row.subscriptionPlanId || row.subscription_plan_id || "").trim() || null
   };
 }
 
@@ -855,6 +857,34 @@ function normalizeWhatsAppTemplate(row) {
     name: String(row.name || "Untitled template").trim().slice(0, 120),
     body: String(row.body || "").trim().slice(0, 4000),
     active: row.active !== false
+  };
+}
+
+function normalizeSubscriptionPlan(row) {
+  const billingCycle = ["monthly", "yearly", "one_time"].includes(String(row.billingCycle || row.billing_cycle || "monthly"))
+    ? String(row.billingCycle || row.billing_cycle || "monthly")
+    : "monthly";
+  const status = ["Active", "Draft", "Inactive"].includes(String(row.status || "Active"))
+    ? String(row.status || "Active")
+    : "Active";
+  const rawFeatures = Array.isArray(row.features)
+    ? row.features
+    : (() => {
+      try { return JSON.parse(row.features_json || "[]"); } catch { return []; }
+    })();
+  return {
+    id: String(row.id || `sp-${Date.now().toString(36)}`).trim(),
+    name: String(row.name || "").trim().slice(0, 120),
+    slug: String(row.slug || "").trim().toLowerCase().slice(0, 140),
+    description: String(row.description || "").trim().slice(0, 1000),
+    price: Number(row.price || 0),
+    billingCycle,
+    maxVehicles: Math.max(1, Math.round(Number(row.maxVehicles ?? row.max_vehicles ?? 1) || 1)),
+    features: rawFeatures.map((feature) => String(feature || "").trim().slice(0, 160)).filter(Boolean).slice(0, 20),
+    status,
+    createdBy: row.createdBy ?? row.created_by ?? null,
+    createdAt: row.createdAt ?? row.created_at ?? null,
+    updatedAt: row.updatedAt ?? row.updated_at ?? null
   };
 }
 
@@ -1588,6 +1618,7 @@ async function ensureCoreTables() {
       email VARCHAR(160),
       city VARCHAR(80),
       phone VARCHAR(24),
+      subscription_plan_id VARCHAR(40) NULL,
       caller_id VARCHAR(32),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`
@@ -1613,6 +1644,12 @@ async function ensureCoreTables() {
       FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
+  try {
+    await pool.query("ALTER TABLE clients ADD COLUMN subscription_plan_id VARCHAR(40) NULL AFTER phone");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
   await ensureVehicleFinanceColumns();
   await pool.query(
     `CREATE TABLE IF NOT EXISTS due_tasks (
@@ -1696,6 +1733,31 @@ async function ensureCoreTables() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS subscription_plans (
+      id VARCHAR(40) PRIMARY KEY,
+      name VARCHAR(120) NOT NULL,
+      slug VARCHAR(140) NOT NULL UNIQUE,
+      description TEXT,
+      price DECIMAL(12,2) NOT NULL DEFAULT 0,
+      billing_cycle ENUM('monthly','yearly','one_time') NOT NULL DEFAULT 'monthly',
+      max_vehicles INT NOT NULL DEFAULT 1,
+      features_json JSON,
+      status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active',
+      created_by VARCHAR(32),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_subscription_plans_status (status)
+    )`
+  );
+  // Migrate the previous label without losing existing plans.
+  try {
+    await pool.query("UPDATE subscription_plans SET status = 'Inactive' WHERE status = 'Archived'");
+    await pool.query("ALTER TABLE subscription_plans MODIFY COLUMN status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active'");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("unknown table") && !message.includes("doesn't exist")) throw error;
+  }
   await ensureClientsEmailColumn();
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
@@ -2759,6 +2821,46 @@ app.put("/api/permissions", asyncHandler(async (req, res) => {
   res.json({ ok: true, rolePermissions: rolePermissionsStore });
 }));
 
+// Subscription plans are managed only from the Admin console. Plans are
+// deliberately stored in their own table so they are not mixed into the
+// browser sync payload used for fleet records.
+app.get("/api/subscription-plans", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  if (!dbAvailable) return res.json(memorySubscriptionPlans.map(normalizeSubscriptionPlan));
+  const [rows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at DESC, name ASC");
+  res.json(rows.map(normalizeSubscriptionPlan));
+}));
+
+app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const plan = normalizeSubscriptionPlan({ ...req.body, createdBy: req.auth.userId });
+  if (!plan.name) return res.status(400).json({ error: "Plan name is required." });
+  if (!Number.isFinite(plan.price) || plan.price < 0) return res.status(400).json({ error: "Price must be a valid non-negative number." });
+  if (!plan.slug) plan.slug = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
+  if (!plan.slug) return res.status(400).json({ error: "A valid plan name is required." });
+
+  if (!dbAvailable) {
+    if (memorySubscriptionPlans.some((item) => item.slug === plan.slug)) return res.status(409).json({ error: "A plan with this slug already exists." });
+    const saved = { ...plan, createdBy: req.auth.userId, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    memorySubscriptionPlans.unshift(saved);
+    return res.status(201).json({ ...normalizeSubscriptionPlan(saved), mode: "memory" });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO subscription_plans
+        (id, name, slug, description, price, billing_cycle, max_vehicles, features_json, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [plan.id, plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.maxVehicles, JSON.stringify(plan.features), plan.status, req.auth.userId]
+    );
+  } catch (error) {
+    if (String(error?.code || "") === "ER_DUP_ENTRY") return res.status(409).json({ error: "A plan with this name or slug already exists." });
+    throw error;
+  }
+  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [plan.id]);
+  res.status(201).json({ ...normalizeSubscriptionPlan(rows[0] || plan), mode: "mysql" });
+}));
+
 app.get("/api/users", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
@@ -2771,6 +2873,7 @@ app.get("/api/users", asyncHandler(async (req, res) => {
 app.post("/api/users", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
   const { name, email, password: clientPassword } = req.body;
+  const subscriptionPlanId = String(req.body?.subscriptionPlanId || req.body?.subscription_plan_id || "").trim() || null;
   const requestedRole = String(req.body?.role || "Customer");
   const userRole = ["Customer", "Owner", "Caller"].includes(requestedRole) ? requestedRole : "Customer";
   const commonPassword = await getCommonPassword();
@@ -2778,12 +2881,18 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Name, email and password are required." });
   }
+  if (userRole !== "Caller" && !subscriptionPlanId) {
+    return res.status(400).json({ error: "A subscription plan is required for a new client." });
+  }
   const lowerEmail = String(email).trim().toLowerCase();
   const id = `u-${Date.now().toString(36)}`;
   let clientId = `c-${id.slice(2)}`;
 
   await pingDb();
   if (!dbAvailable) {
+    if (userRole !== "Caller" && !memorySubscriptionPlans.some((plan) => plan.id === subscriptionPlanId)) {
+      return res.status(400).json({ error: "Selected subscription plan was not found." });
+    }
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
       return res.status(400).json({ error: "Email already exists." });
     }
@@ -2796,14 +2905,21 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       if (existingClient) {
         clientId = existingClient.id;
         existingClient.email = lowerEmail;
+        existingClient.subscription_plan_id = subscriptionPlanId;
       } else {
-        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password });
+        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", subscription_plan_id: subscriptionPlanId, caller_id: null, password });
       }
     }
-    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "memory" });
+    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "memory" });
   }
 
   await ensureClientsEmailColumn();
+  const [planRows] = userRole !== "Caller"
+    ? await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status <> 'Inactive' LIMIT 1", [subscriptionPlanId])
+    : [[]];
+  if (userRole !== "Caller" && !planRows.length) {
+    return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
+  }
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -2821,11 +2937,11 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       );
       if (existingClients.length) {
         clientId = existingClients[0].id;
-        await conn.query("UPDATE clients SET email = ? WHERE id = ?", [lowerEmail, clientId]);
+        await conn.query("UPDATE clients SET email = ?, subscription_plan_id = ? WHERE id = ?", [lowerEmail, subscriptionPlanId, clientId]);
       } else {
         await conn.query(
-          "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
-          [clientId, name, lowerEmail]
+          "INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, caller_id) VALUES (?, ?, ?, '', '', ?, NULL)",
+          [clientId, name, lowerEmail, subscriptionPlanId]
         );
       }
     }
@@ -2836,7 +2952,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   } finally {
     conn.release();
   }
-  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "mysql" });
+  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "mysql" });
 }));
 
 // Delete a client, its customer account and every dependent record.
@@ -4033,15 +4149,16 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
 
     for (const client of safeClients) {
       await conn.query(
-        `INSERT INTO clients (id, name, email, city, phone, caller_id)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, caller_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
            email = VALUES(email),
            city = VALUES(city),
            phone = VALUES(phone),
+           subscription_plan_id = VALUES(subscription_plan_id),
            caller_id = VALUES(caller_id)`,
-        [client.id, client.name, client.email, client.city, client.phone, client.caller_id]
+        [client.id, client.name, client.email, client.city, client.phone, client.subscription_plan_id, client.caller_id]
       );
       await ensureCustomerUserForClient(client, conn);
     }

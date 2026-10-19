@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS clients (
   email VARCHAR(160),
   city VARCHAR(80),
   phone VARCHAR(24),
+  subscription_plan_id VARCHAR(40) NULL,
   caller_id VARCHAR(32),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (caller_id) REFERENCES users(id) ON DELETE SET NULL
@@ -176,6 +177,22 @@ CREATE TABLE IF NOT EXISTS settings (
   setting_key VARCHAR(120) PRIMARY KEY,
   setting_value TEXT,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS subscription_plans (
+  id VARCHAR(40) PRIMARY KEY,
+  name VARCHAR(120) NOT NULL,
+  slug VARCHAR(140) NOT NULL UNIQUE,
+  description TEXT,
+  price DECIMAL(12,2) NOT NULL DEFAULT 0,
+  billing_cycle ENUM('monthly','yearly','one_time') NOT NULL DEFAULT 'monthly',
+  max_vehicles INT NOT NULL DEFAULT 1,
+  features_json JSON,
+  status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active',
+  created_by VARCHAR(32),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_subscription_plans_status (status)
 );
 
 -- Detailed customer Excel uploads used by web, admin app and customer app

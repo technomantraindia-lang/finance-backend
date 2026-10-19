@@ -879,6 +879,8 @@ function normalizeSubscriptionPlan(row) {
     description: String(row.description || "").trim().slice(0, 1000),
     price: Number(row.price || 0),
     billingCycle,
+    startDate: toMysqlDate(row.startDate ?? row.start_date),
+    endDate: toMysqlDate(row.endDate ?? row.end_date),
     maxVehicles: Math.max(1, Math.round(Number(row.maxVehicles ?? row.max_vehicles ?? 1) || 1)),
     features: rawFeatures.map((feature) => String(feature || "").trim().slice(0, 160)).filter(Boolean).slice(0, 20),
     status,
@@ -1741,6 +1743,8 @@ async function ensureCoreTables() {
       description TEXT,
       price DECIMAL(12,2) NOT NULL DEFAULT 0,
       billing_cycle ENUM('monthly','yearly','one_time') NOT NULL DEFAULT 'monthly',
+      start_date DATE NULL,
+      end_date DATE NULL,
       max_vehicles INT NOT NULL DEFAULT 1,
       features_json JSON,
       status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active',
@@ -1750,6 +1754,18 @@ async function ensureCoreTables() {
       INDEX idx_subscription_plans_status (status)
     )`
   );
+  try {
+    await pool.query("ALTER TABLE subscription_plans ADD COLUMN start_date DATE NULL AFTER billing_cycle");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
+  try {
+    await pool.query("ALTER TABLE subscription_plans ADD COLUMN end_date DATE NULL AFTER start_date");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
   // Migrate the previous label without losing existing plans.
   try {
     await pool.query("UPDATE subscription_plans SET status = 'Inactive' WHERE status = 'Archived'");
@@ -2838,6 +2854,7 @@ app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   if (!Number.isFinite(plan.price) || plan.price < 0) return res.status(400).json({ error: "Price must be a valid non-negative number." });
   if (!plan.slug) plan.slug = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
   if (!plan.slug) return res.status(400).json({ error: "A valid plan name is required." });
+  if (plan.startDate && plan.endDate && plan.endDate < plan.startDate) return res.status(400).json({ error: "End date cannot be before start date." });
 
   if (!dbAvailable) {
     if (memorySubscriptionPlans.some((item) => item.slug === plan.slug)) return res.status(409).json({ error: "A plan with this slug already exists." });
@@ -2849,9 +2866,9 @@ app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   try {
     await pool.query(
       `INSERT INTO subscription_plans
-        (id, name, slug, description, price, billing_cycle, max_vehicles, features_json, status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [plan.id, plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.maxVehicles, JSON.stringify(plan.features), plan.status, req.auth.userId]
+        (id, name, slug, description, price, billing_cycle, start_date, end_date, max_vehicles, features_json, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [plan.id, plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.startDate, plan.endDate, plan.maxVehicles, JSON.stringify(plan.features), plan.status, req.auth.userId]
     );
   } catch (error) {
     if (String(error?.code || "") === "ER_DUP_ENTRY") return res.status(409).json({ error: "A plan with this name or slug already exists." });
@@ -2859,6 +2876,63 @@ app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   }
   const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [plan.id]);
   res.status(201).json({ ...normalizeSubscriptionPlan(rows[0] || plan), mode: "mysql" });
+}));
+
+app.put("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Plan id is required." });
+  const plan = normalizeSubscriptionPlan({ ...req.body, id, createdBy: req.auth.userId });
+  if (!plan.name) return res.status(400).json({ error: "Plan name is required." });
+  if (!Number.isFinite(plan.price) || plan.price < 0) return res.status(400).json({ error: "Price must be a valid non-negative number." });
+  if (!plan.slug) plan.slug = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
+  if (!plan.slug) return res.status(400).json({ error: "A valid plan name is required." });
+  if (plan.startDate && plan.endDate && plan.endDate < plan.startDate) return res.status(400).json({ error: "End date cannot be before start date." });
+
+  if (!dbAvailable) {
+    const index = memorySubscriptionPlans.findIndex((item) => item.id === id);
+    if (index < 0) return res.status(404).json({ error: "Subscription plan not found." });
+    if (memorySubscriptionPlans.some((item) => item.id !== id && item.slug === plan.slug)) return res.status(409).json({ error: "A plan with this slug already exists." });
+    const saved = { ...memorySubscriptionPlans[index], ...plan, id, updatedAt: new Date().toISOString() };
+    memorySubscriptionPlans[index] = saved;
+    return res.json({ ...normalizeSubscriptionPlan(saved), mode: "memory" });
+  }
+
+  try {
+    const [result] = await pool.query(
+      `UPDATE subscription_plans
+       SET name = ?, slug = ?, description = ?, price = ?, billing_cycle = ?, start_date = ?, end_date = ?, max_vehicles = ?, features_json = ?, status = ?
+       WHERE id = ?`,
+      [plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.startDate, plan.endDate, plan.maxVehicles, JSON.stringify(plan.features), plan.status, id]
+    );
+    if (!result.affectedRows) return res.status(404).json({ error: "Subscription plan not found." });
+  } catch (error) {
+    if (String(error?.code || "") === "ER_DUP_ENTRY") return res.status(409).json({ error: "A plan with this slug already exists." });
+    throw error;
+  }
+  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [id]);
+  res.json({ ...normalizeSubscriptionPlan(rows[0] || plan), mode: "mysql" });
+}));
+
+app.delete("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Plan id is required." });
+
+  if (!dbAvailable) {
+    if (!memorySubscriptionPlans.some((plan) => plan.id === id)) return res.status(404).json({ error: "Subscription plan not found." });
+    if (memoryClients.some((client) => client.subscription_plan_id === id)) return res.status(409).json({ error: "This plan is assigned to a client. Reassign that client before deleting the plan." });
+    memorySubscriptionPlans.splice(memorySubscriptionPlans.findIndex((plan) => plan.id === id), 1);
+    return res.json({ ok: true, id, mode: "memory" });
+  }
+
+  const [assignedRows] = await pool.query("SELECT COUNT(*) AS count FROM clients WHERE subscription_plan_id = ?", [id]);
+  if (Number(assignedRows[0]?.count || 0) > 0) {
+    return res.status(409).json({ error: "This plan is assigned to a client. Reassign that client before deleting the plan." });
+  }
+  const [result] = await pool.query("DELETE FROM subscription_plans WHERE id = ?", [id]);
+  if (!result.affectedRows) return res.status(404).json({ error: "Subscription plan not found." });
+  res.json({ ok: true, id, mode: "mysql" });
 }));
 
 app.get("/api/users", asyncHandler(async (req, res) => {

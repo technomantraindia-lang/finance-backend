@@ -186,6 +186,8 @@ CREATE TABLE IF NOT EXISTS subscription_plans (
   description TEXT,
   price DECIMAL(12,2) NOT NULL DEFAULT 0,
   billing_cycle ENUM('monthly','yearly','one_time') NOT NULL DEFAULT 'monthly',
+  start_date DATE NULL,
+  end_date DATE NULL,
   max_vehicles INT NOT NULL DEFAULT 1,
   features_json JSON,
   status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active',

@@ -219,6 +219,7 @@ const defaultRolePermissions = [
   ["Owner chat", "Reports only", "Yes", "No", "Yes"]
 ];
 let rolePermissionsStore = null;
+let subscriptionFeatureEnabledStore = true;
 
 function sanitizeReminderSettings(input = {}) {
   const enabled = typeof input.enabled === "boolean"
@@ -242,6 +243,23 @@ function sanitizeReminderSettings(input = {}) {
 
 function currentReminderSettings() {
   return reminderSettingsStore;
+}
+
+async function getSubscriptionFeatureEnabled() {
+  if (dbAvailable) {
+    try {
+      const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_feature_enabled' LIMIT 1");
+      if (rows.length && rows[0].setting_value !== null && rows[0].setting_value !== undefined) {
+        subscriptionFeatureEnabledStore = String(rows[0].setting_value).toLowerCase() !== "false";
+        return subscriptionFeatureEnabledStore;
+      }
+      await pool.query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_feature_enabled', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+        [subscriptionFeatureEnabledStore ? "true" : "false"]
+      );
+    } catch { /* keep the runtime default when settings are unavailable */ }
+  }
+  return subscriptionFeatureEnabledStore;
 }
 
 async function loadReminderSettingsFromDatabase() {
@@ -1783,6 +1801,7 @@ async function ensureCoreTables() {
   await ensureMarketplaceThreadsTable();
   await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
+  await getSubscriptionFeatureEnabled();
   await ensureAdminUser();
 }
 
@@ -2715,7 +2734,26 @@ app.get("/api/settings", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
   const value = await getCommonPassword();
   const rolePermissions = await getRolePermissions();
-  res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings() });
+  const subscriptionFeatureEnabled = await getSubscriptionFeatureEnabled();
+  res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings(), subscriptionFeatureEnabled });
+}));
+
+app.put("/api/subscription-feature", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const rawEnabled = req.body?.enabled;
+  const enabled = rawEnabled === undefined
+    ? true
+    : rawEnabled === true || String(rawEnabled).toLowerCase() === "true";
+  subscriptionFeatureEnabledStore = enabled;
+  if (dbAvailable) {
+    try {
+      await pool.query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_feature_enabled', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
+        [enabled ? "true" : "false"]
+      );
+    } catch { /* keep runtime value when the optional settings table is unavailable */ }
+  }
+  res.json({ ok: true, subscriptionFeatureEnabled: subscriptionFeatureEnabledStore });
 }));
 
 app.get("/api/reminder-settings", asyncHandler(async (req, res) => {
@@ -2955,16 +2993,13 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   if (!name || !email || !password) {
     return res.status(400).json({ error: "Name, email and password are required." });
   }
-  if (userRole !== "Caller" && !subscriptionPlanId) {
-    return res.status(400).json({ error: "A subscription plan is required for a new client." });
-  }
   const lowerEmail = String(email).trim().toLowerCase();
   const id = `u-${Date.now().toString(36)}`;
   let clientId = `c-${id.slice(2)}`;
 
   await pingDb();
   if (!dbAvailable) {
-    if (userRole !== "Caller" && !memorySubscriptionPlans.some((plan) => plan.id === subscriptionPlanId)) {
+    if (userRole !== "Caller" && subscriptionPlanId && !memorySubscriptionPlans.some((plan) => plan.id === subscriptionPlanId && plan.status !== "Inactive")) {
       return res.status(400).json({ error: "Selected subscription plan was not found." });
     }
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
@@ -2988,10 +3023,10 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   }
 
   await ensureClientsEmailColumn();
-  const [planRows] = userRole !== "Caller"
+  const [planRows] = userRole !== "Caller" && subscriptionPlanId
     ? await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status <> 'Inactive' LIMIT 1", [subscriptionPlanId])
     : [[]];
-  if (userRole !== "Caller" && !planRows.length) {
+  if (userRole !== "Caller" && subscriptionPlanId && !planRows.length) {
     return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
   }
   const conn = await pool.getConnection();
@@ -3027,6 +3062,32 @@ app.post("/api/users", asyncHandler(async (req, res) => {
     conn.release();
   }
   res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "mysql" });
+}));
+
+// Assign or upgrade a client's subscription from the client profile.
+app.patch("/api/clients/:id/subscription-plan", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const clientId = String(req.params.id || "").trim();
+  const subscriptionPlanId = String(req.body?.subscriptionPlanId || req.body?.subscription_plan_id || "").trim();
+  if (!clientId) return res.status(400).json({ error: "Client id is required." });
+  if (!subscriptionPlanId) return res.status(400).json({ error: "A subscription plan is required." });
+
+  await pingDb();
+  if (!dbAvailable) {
+    const client = memoryClients.find((item) => item.id === clientId);
+    if (!client) return res.status(404).json({ error: "Client not found." });
+    const plan = memorySubscriptionPlans.find((item) => item.id === subscriptionPlanId && item.status === "Active");
+    if (!plan) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
+    client.subscription_plan_id = subscriptionPlanId;
+    return res.json({ id: clientId, subscriptionPlanId, mode: "memory" });
+  }
+
+  const [clientRows] = await pool.query("SELECT id FROM clients WHERE id = ? LIMIT 1", [clientId]);
+  if (!clientRows.length) return res.status(404).json({ error: "Client not found." });
+  const [planRows] = await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status = 'Active' LIMIT 1", [subscriptionPlanId]);
+  if (!planRows.length) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
+  await pool.query("UPDATE clients SET subscription_plan_id = ? WHERE id = ?", [subscriptionPlanId, clientId]);
+  res.json({ id: clientId, subscriptionPlanId, mode: "mysql" });
 }));
 
 // Delete a client, its customer account and every dependent record.

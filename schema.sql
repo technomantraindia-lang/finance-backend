@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS clients (
   city VARCHAR(80),
   phone VARCHAR(24),
   subscription_plan_id VARCHAR(40) NULL,
+  subscription_start_date DATE NULL,
+  subscription_end_date DATE NULL,
   caller_id VARCHAR(32),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (caller_id) REFERENCES users(id) ON DELETE SET NULL

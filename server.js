@@ -383,7 +383,9 @@ function normalizeClient(row) {
     phone: row.phone || "",
     caller_id: row.callerId || row.caller_id || null,
     email: String(row.email || row.loginEmail || "").trim().toLowerCase(),
-    subscription_plan_id: String(row.subscriptionPlanId || row.subscription_plan_id || "").trim() || null
+    subscription_plan_id: String(row.subscriptionPlanId || row.subscription_plan_id || "").trim() || null,
+    subscription_start_date: toMysqlDate(row.subscriptionStartDate ?? row.subscription_start_date),
+    subscription_end_date: toMysqlDate(row.subscriptionEndDate ?? row.subscription_end_date)
   };
 }
 
@@ -1084,6 +1086,22 @@ function formatDateOnly(date) {
   return `${year}-${month}-${day}`;
 }
 
+function todaySubscriptionDate() {
+  return formatDateOnly(new Date());
+}
+
+function subscriptionEndDateFor(startDate, billingCycle) {
+  const normalizedStart = toMysqlDate(startDate) || todaySubscriptionDate();
+  const [year, month, day] = normalizedStart.split("-").map(Number);
+  if (billingCycle === "one_time") return normalizedStart;
+  const date = new Date(year, month - 1, 1);
+  if (billingCycle === "yearly") date.setFullYear(date.getFullYear() + 1);
+  else date.setMonth(date.getMonth() + 1);
+  const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+  date.setDate(Math.min(day, lastDay));
+  return formatDateOnly(date);
+}
+
 function daysUntil(date, today = new Date()) {
   const start = parseDueDate(today);
   const end = parseDueDate(date);
@@ -1639,6 +1657,8 @@ async function ensureCoreTables() {
       city VARCHAR(80),
       phone VARCHAR(24),
       subscription_plan_id VARCHAR(40) NULL,
+      subscription_start_date DATE NULL,
+      subscription_end_date DATE NULL,
       caller_id VARCHAR(32),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`
@@ -1666,6 +1686,18 @@ async function ensureCoreTables() {
   );
   try {
     await pool.query("ALTER TABLE clients ADD COLUMN subscription_plan_id VARCHAR(40) NULL AFTER phone");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
+  try {
+    await pool.query("ALTER TABLE clients ADD COLUMN subscription_start_date DATE NULL AFTER subscription_plan_id");
+  } catch (error) {
+    const message = String(error?.message || "").toLowerCase();
+    if (!message.includes("duplicate column")) throw error;
+  }
+  try {
+    await pool.query("ALTER TABLE clients ADD COLUMN subscription_end_date DATE NULL AFTER subscription_start_date");
   } catch (error) {
     const message = String(error?.message || "").toLowerCase();
     if (!message.includes("duplicate column")) throw error;
@@ -2731,6 +2763,9 @@ app.get("/api/common-password", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/settings", asyncHandler(async (req, res) => {
+  if (isCustomerRequest(req)) {
+    return res.json({ subscriptionFeatureEnabled: await getSubscriptionFeatureEnabled() });
+  }
   if (denyUnlessAdmin(req, res)) return;
   const value = await getCommonPassword();
   const rolePermissions = await getRolePermissions();
@@ -2879,10 +2914,70 @@ app.put("/api/permissions", asyncHandler(async (req, res) => {
 // deliberately stored in their own table so they are not mixed into the
 // browser sync payload used for fleet records.
 app.get("/api/subscription-plans", asyncHandler(async (req, res) => {
+  if (isCustomerRequest(req)) {
+    if (!(await getSubscriptionFeatureEnabled())) return res.json([]);
+    if (!dbAvailable) return res.json(memorySubscriptionPlans.filter((plan) => plan.status === "Active").map(normalizeSubscriptionPlan));
+    const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE status = 'Active' ORDER BY price ASC, name ASC");
+    return res.json(rows.map(normalizeSubscriptionPlan));
+  }
   if (denyUnlessAdmin(req, res)) return;
   if (!dbAvailable) return res.json(memorySubscriptionPlans.map(normalizeSubscriptionPlan));
   const [rows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at DESC, name ASC");
   res.json(rows.map(normalizeSubscriptionPlan));
+}));
+
+// A customer can activate only an active plan for their own account. The
+// dates are calculated on the server so the Admin profile sees the same
+// authoritative validity window after the customer completes activation.
+app.post("/api/customer/subscription/activate", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
+  if (!(await getSubscriptionFeatureEnabled())) return res.status(409).json({ error: "Subscription feature is currently disabled." });
+  const planId = String(req.body?.planId || req.body?.subscriptionPlanId || "").trim();
+  if (!planId) return res.status(400).json({ error: "A subscription plan is required." });
+
+  await pingDb();
+  if (!dbAvailable) {
+    const allowedClientIds = [...memoryClientIdsForRequest(req)];
+    const clientId = allowedClientIds[0] || String(req.auth.clientId || "").trim();
+    const client = memoryClients.find((item) => item.id === clientId);
+    const plan = memorySubscriptionPlans.find((item) => item.id === planId && item.status === "Active");
+    if (!client) return res.status(404).json({ error: "Customer account was not found." });
+    if (!plan) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
+    const startDate = todaySubscriptionDate();
+    const endDate = subscriptionEndDateFor(startDate, plan.billingCycle);
+    client.subscription_plan_id = plan.id;
+    client.subscription_start_date = startDate;
+    client.subscription_end_date = endDate;
+    return res.json({
+      clientId,
+      subscriptionPlanId: plan.id,
+      subscriptionStartDate: startDate,
+      subscriptionEndDate: endDate,
+      plan: normalizeSubscriptionPlan(plan),
+      mode: "memory"
+    });
+  }
+
+  const allowedClientIds = await mysqlClientIdsForRequest(req);
+  const clientId = String(req.auth.clientId || allowedClientIds[0] || "").trim();
+  if (!clientId || !allowedClientIds.includes(clientId)) return res.status(404).json({ error: "Customer account was not found." });
+  const [planRows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? AND status = 'Active' LIMIT 1", [planId]);
+  if (!planRows.length) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
+  const plan = normalizeSubscriptionPlan(planRows[0]);
+  const startDate = todaySubscriptionDate();
+  const endDate = subscriptionEndDateFor(startDate, plan.billingCycle);
+  await pool.query(
+    "UPDATE clients SET subscription_plan_id = ?, subscription_start_date = ?, subscription_end_date = ? WHERE id = ?",
+    [plan.id, startDate, endDate, clientId]
+  );
+  res.json({
+    clientId,
+    subscriptionPlanId: plan.id,
+    subscriptionStartDate: startDate,
+    subscriptionEndDate: endDate,
+    plan,
+    mode: "mysql"
+  });
 }));
 
 app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
@@ -3015,8 +3110,10 @@ app.post("/api/users", asyncHandler(async (req, res) => {
         clientId = existingClient.id;
         existingClient.email = lowerEmail;
         existingClient.subscription_plan_id = subscriptionPlanId;
+        existingClient.subscription_start_date = null;
+        existingClient.subscription_end_date = null;
       } else {
-        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", subscription_plan_id: subscriptionPlanId, caller_id: null, password });
+        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", subscription_plan_id: subscriptionPlanId, subscription_start_date: null, subscription_end_date: null, caller_id: null, password });
       }
     }
     return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "memory" });
@@ -3046,7 +3143,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       );
       if (existingClients.length) {
         clientId = existingClients[0].id;
-        await conn.query("UPDATE clients SET email = ?, subscription_plan_id = ? WHERE id = ?", [lowerEmail, subscriptionPlanId, clientId]);
+        await conn.query("UPDATE clients SET email = ?, subscription_plan_id = ?, subscription_start_date = NULL, subscription_end_date = NULL WHERE id = ?", [lowerEmail, subscriptionPlanId, clientId]);
       } else {
         await conn.query(
           "INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, caller_id) VALUES (?, ?, ?, '', '', ?, NULL)",
@@ -3069,8 +3166,13 @@ app.patch("/api/clients/:id/subscription-plan", asyncHandler(async (req, res) =>
   if (denyUnlessAdmin(req, res)) return;
   const clientId = String(req.params.id || "").trim();
   const subscriptionPlanId = String(req.body?.subscriptionPlanId || req.body?.subscription_plan_id || "").trim();
+  const subscriptionStartDate = toMysqlDate(req.body?.subscriptionStartDate ?? req.body?.subscription_start_date);
+  const subscriptionEndDate = toMysqlDate(req.body?.subscriptionEndDate ?? req.body?.subscription_end_date);
   if (!clientId) return res.status(400).json({ error: "Client id is required." });
   if (!subscriptionPlanId) return res.status(400).json({ error: "A subscription plan is required." });
+  if (subscriptionStartDate && subscriptionEndDate && subscriptionEndDate < subscriptionStartDate) {
+    return res.status(400).json({ error: "Subscription end date cannot be before the start date." });
+  }
 
   await pingDb();
   if (!dbAvailable) {
@@ -3079,15 +3181,17 @@ app.patch("/api/clients/:id/subscription-plan", asyncHandler(async (req, res) =>
     const plan = memorySubscriptionPlans.find((item) => item.id === subscriptionPlanId && item.status === "Active");
     if (!plan) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
     client.subscription_plan_id = subscriptionPlanId;
-    return res.json({ id: clientId, subscriptionPlanId, mode: "memory" });
+    client.subscription_start_date = subscriptionStartDate;
+    client.subscription_end_date = subscriptionEndDate;
+    return res.json({ id: clientId, subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, mode: "memory" });
   }
 
   const [clientRows] = await pool.query("SELECT id FROM clients WHERE id = ? LIMIT 1", [clientId]);
   if (!clientRows.length) return res.status(404).json({ error: "Client not found." });
   const [planRows] = await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status = 'Active' LIMIT 1", [subscriptionPlanId]);
   if (!planRows.length) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-  await pool.query("UPDATE clients SET subscription_plan_id = ? WHERE id = ?", [subscriptionPlanId, clientId]);
-  res.json({ id: clientId, subscriptionPlanId, mode: "mysql" });
+  await pool.query("UPDATE clients SET subscription_plan_id = ?, subscription_start_date = ?, subscription_end_date = ? WHERE id = ?", [subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, clientId]);
+  res.json({ id: clientId, subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, mode: "mysql" });
 }));
 
 // Delete a client, its customer account and every dependent record.
@@ -4284,16 +4388,18 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
 
     for (const client of safeClients) {
       await conn.query(
-        `INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, caller_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, subscription_start_date, subscription_end_date, caller_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
            email = VALUES(email),
            city = VALUES(city),
            phone = VALUES(phone),
            subscription_plan_id = VALUES(subscription_plan_id),
+           subscription_start_date = VALUES(subscription_start_date),
+           subscription_end_date = VALUES(subscription_end_date),
            caller_id = VALUES(caller_id)`,
-        [client.id, client.name, client.email, client.city, client.phone, client.subscription_plan_id, client.caller_id]
+        [client.id, client.name, client.email, client.city, client.phone, client.subscription_plan_id, client.subscription_start_date, client.subscription_end_date, client.caller_id]
       );
       await ensureCustomerUserForClient(client, conn);
     }

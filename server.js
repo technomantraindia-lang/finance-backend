@@ -205,7 +205,6 @@ const memorySaleClosings = [];
 const memoryMarketplaceInterests = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
-const memorySubscriptionPlans = [];
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -219,7 +218,6 @@ const defaultRolePermissions = [
   ["Owner chat", "Reports only", "Yes", "No", "Yes"]
 ];
 let rolePermissionsStore = null;
-let subscriptionFeatureEnabledStore = true;
 
 function sanitizeReminderSettings(input = {}) {
   const enabled = typeof input.enabled === "boolean"
@@ -243,23 +241,6 @@ function sanitizeReminderSettings(input = {}) {
 
 function currentReminderSettings() {
   return reminderSettingsStore;
-}
-
-async function getSubscriptionFeatureEnabled() {
-  if (dbAvailable) {
-    try {
-      const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_feature_enabled' LIMIT 1");
-      if (rows.length && rows[0].setting_value !== null && rows[0].setting_value !== undefined) {
-        subscriptionFeatureEnabledStore = String(rows[0].setting_value).toLowerCase() !== "false";
-        return subscriptionFeatureEnabledStore;
-      }
-      await pool.query(
-        "INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_feature_enabled', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
-        [subscriptionFeatureEnabledStore ? "true" : "false"]
-      );
-    } catch { /* keep the runtime default when settings are unavailable */ }
-  }
-  return subscriptionFeatureEnabledStore;
 }
 
 async function loadReminderSettingsFromDatabase() {
@@ -382,10 +363,7 @@ function normalizeClient(row) {
     city: row.city || "",
     phone: row.phone || "",
     caller_id: row.callerId || row.caller_id || null,
-    email: String(row.email || row.loginEmail || "").trim().toLowerCase(),
-    subscription_plan_id: String(row.subscriptionPlanId || row.subscription_plan_id || "").trim() || null,
-    subscription_start_date: toMysqlDate(row.subscriptionStartDate ?? row.subscription_start_date),
-    subscription_end_date: toMysqlDate(row.subscriptionEndDate ?? row.subscription_end_date)
+    email: String(row.email || row.loginEmail || "").trim().toLowerCase()
   };
 }
 
@@ -880,37 +858,6 @@ function normalizeWhatsAppTemplate(row) {
   };
 }
 
-function normalizeSubscriptionPlan(row) {
-  const billingCycle = ["monthly", "yearly", "one_time"].includes(String(row.billingCycle || row.billing_cycle || "monthly"))
-    ? String(row.billingCycle || row.billing_cycle || "monthly")
-    : "monthly";
-  const status = ["Active", "Draft", "Inactive"].includes(String(row.status || "Active"))
-    ? String(row.status || "Active")
-    : "Active";
-  const rawFeatures = Array.isArray(row.features)
-    ? row.features
-    : (() => {
-      try { return JSON.parse(row.features_json || "[]"); } catch { return []; }
-    })();
-  return {
-    id: String(row.id || `sp-${Date.now().toString(36)}`).trim(),
-    name: String(row.name || "").trim().slice(0, 120),
-    slug: String(row.slug || "").trim().toLowerCase().slice(0, 140),
-    description: String(row.description || "").trim().slice(0, 1000),
-    price: Number(row.price || 0),
-    billingCycle,
-    startDate: toMysqlDate(row.startDate ?? row.start_date),
-    endDate: toMysqlDate(row.endDate ?? row.end_date),
-    maxVehicles: Math.max(1, Math.round(Number(row.maxVehicles ?? row.max_vehicles ?? 1) || 1)),
-    features: rawFeatures.map((feature) => String(feature || "").trim().slice(0, 160)).filter(Boolean).slice(0, 20),
-    status,
-    customerCount: Math.max(0, Number(row.customerCount ?? row.customer_count ?? 0) || 0),
-    createdBy: row.createdBy ?? row.created_by ?? null,
-    createdAt: row.createdAt ?? row.created_at ?? null,
-    updatedAt: row.updatedAt ?? row.updated_at ?? null
-  };
-}
-
 function normalizeWhatsAppMessage(row) {
   const now = new Date().toISOString();
   const allowedStatuses = new Set(["Prepared", "Opened", "Sent", "Delivered", "Failed"]);
@@ -1085,22 +1032,6 @@ function formatDateOnly(date) {
   const month = String(parsed.getMonth() + 1).padStart(2, "0");
   const day = String(parsed.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
-}
-
-function todaySubscriptionDate() {
-  return formatDateOnly(new Date());
-}
-
-function subscriptionEndDateFor(startDate, billingCycle) {
-  const normalizedStart = toMysqlDate(startDate) || todaySubscriptionDate();
-  const [year, month, day] = normalizedStart.split("-").map(Number);
-  if (billingCycle === "one_time") return normalizedStart;
-  const date = new Date(year, month - 1, 1);
-  if (billingCycle === "yearly") date.setFullYear(date.getFullYear() + 1);
-  else date.setMonth(date.getMonth() + 1);
-  const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
-  date.setDate(Math.min(day, lastDay));
-  return formatDateOnly(date);
 }
 
 function daysUntil(date, today = new Date()) {
@@ -1657,9 +1588,6 @@ async function ensureCoreTables() {
       email VARCHAR(160),
       city VARCHAR(80),
       phone VARCHAR(24),
-      subscription_plan_id VARCHAR(40) NULL,
-      subscription_start_date DATE NULL,
-      subscription_end_date DATE NULL,
       caller_id VARCHAR(32),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`
@@ -1685,24 +1613,6 @@ async function ensureCoreTables() {
       FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
-  try {
-    await pool.query("ALTER TABLE clients ADD COLUMN subscription_plan_id VARCHAR(40) NULL AFTER phone");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("duplicate column")) throw error;
-  }
-  try {
-    await pool.query("ALTER TABLE clients ADD COLUMN subscription_start_date DATE NULL AFTER subscription_plan_id");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("duplicate column")) throw error;
-  }
-  try {
-    await pool.query("ALTER TABLE clients ADD COLUMN subscription_end_date DATE NULL AFTER subscription_start_date");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("duplicate column")) throw error;
-  }
   await ensureVehicleFinanceColumns();
   await pool.query(
     `CREATE TABLE IF NOT EXISTS due_tasks (
@@ -1786,45 +1696,6 @@ async function ensureCoreTables() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   );
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS subscription_plans (
-      id VARCHAR(40) PRIMARY KEY,
-      name VARCHAR(120) NOT NULL,
-      slug VARCHAR(140) NOT NULL UNIQUE,
-      description TEXT,
-      price DECIMAL(12,2) NOT NULL DEFAULT 0,
-      billing_cycle ENUM('monthly','yearly','one_time') NOT NULL DEFAULT 'monthly',
-      start_date DATE NULL,
-      end_date DATE NULL,
-      max_vehicles INT NOT NULL DEFAULT 1,
-      features_json JSON,
-      status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active',
-      created_by VARCHAR(32),
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      INDEX idx_subscription_plans_status (status)
-    )`
-  );
-  try {
-    await pool.query("ALTER TABLE subscription_plans ADD COLUMN start_date DATE NULL AFTER billing_cycle");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("duplicate column")) throw error;
-  }
-  try {
-    await pool.query("ALTER TABLE subscription_plans ADD COLUMN end_date DATE NULL AFTER start_date");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("duplicate column")) throw error;
-  }
-  // Migrate the previous label without losing existing plans.
-  try {
-    await pool.query("UPDATE subscription_plans SET status = 'Inactive' WHERE status = 'Archived'");
-    await pool.query("ALTER TABLE subscription_plans MODIFY COLUMN status ENUM('Active','Draft','Inactive') NOT NULL DEFAULT 'Active'");
-  } catch (error) {
-    const message = String(error?.message || "").toLowerCase();
-    if (!message.includes("unknown table") && !message.includes("doesn't exist")) throw error;
-  }
   await ensureClientsEmailColumn();
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
@@ -1834,7 +1705,6 @@ async function ensureCoreTables() {
   await ensureMarketplaceThreadsTable();
   await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
-  await getSubscriptionFeatureEnabled();
   await ensureAdminUser();
 }
 
@@ -2764,32 +2634,10 @@ app.get("/api/common-password", asyncHandler(async (req, res) => {
 }));
 
 app.get("/api/settings", asyncHandler(async (req, res) => {
-  if (isCustomerRequest(req)) {
-    return res.json({ subscriptionFeatureEnabled: await getSubscriptionFeatureEnabled() });
-  }
   if (denyUnlessAdmin(req, res)) return;
   const value = await getCommonPassword();
   const rolePermissions = await getRolePermissions();
-  const subscriptionFeatureEnabled = await getSubscriptionFeatureEnabled();
-  res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings(), subscriptionFeatureEnabled });
-}));
-
-app.put("/api/subscription-feature", asyncHandler(async (req, res) => {
-  if (denyUnlessAdmin(req, res)) return;
-  const rawEnabled = req.body?.enabled;
-  const enabled = rawEnabled === undefined
-    ? true
-    : rawEnabled === true || String(rawEnabled).toLowerCase() === "true";
-  subscriptionFeatureEnabledStore = enabled;
-  if (dbAvailable) {
-    try {
-      await pool.query(
-        "INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_feature_enabled', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
-        [enabled ? "true" : "false"]
-      );
-    } catch { /* keep runtime value when the optional settings table is unavailable */ }
-  }
-  res.json({ ok: true, subscriptionFeatureEnabled: subscriptionFeatureEnabledStore });
+  res.json({ commonCustomerPassword: value, rolePermissions, reminderSettings: currentReminderSettings() });
 }));
 
 app.get("/api/reminder-settings", asyncHandler(async (req, res) => {
@@ -2911,175 +2759,6 @@ app.put("/api/permissions", asyncHandler(async (req, res) => {
   res.json({ ok: true, rolePermissions: rolePermissionsStore });
 }));
 
-// Subscription plans are managed only from the Admin console. Plans are
-// deliberately stored in their own table so they are not mixed into the
-// browser sync payload used for fleet records.
-app.get("/api/subscription-plans", asyncHandler(async (req, res) => {
-  if (isCustomerRequest(req)) {
-    if (!(await getSubscriptionFeatureEnabled())) return res.json([]);
-    if (!dbAvailable) return res.json(memorySubscriptionPlans.filter((plan) => plan.status === "Active").map(normalizeSubscriptionPlan));
-    const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE status = 'Active' ORDER BY price ASC, name ASC");
-    return res.json(rows.map(normalizeSubscriptionPlan));
-  }
-  if (denyUnlessAdmin(req, res)) return;
-  if (!dbAvailable) {
-    return res.json(memorySubscriptionPlans.map((plan) => normalizeSubscriptionPlan({
-      ...plan,
-      customerCount: memoryClients.filter((client) => client.subscription_plan_id === plan.id).length
-    })));
-  }
-  const [rows] = await pool.query(
-    `SELECT p.*, COUNT(c.id) AS customer_count
-     FROM subscription_plans p
-     LEFT JOIN clients c ON c.subscription_plan_id = p.id
-     GROUP BY p.id
-     ORDER BY p.created_at DESC, p.name ASC`
-  );
-  res.json(rows.map(normalizeSubscriptionPlan));
-}));
-
-// A customer can activate only an active plan for their own account. The
-// dates are calculated on the server so the Admin profile sees the same
-// authoritative validity window after the customer completes activation.
-app.post("/api/customer/subscription/activate", asyncHandler(async (req, res) => {
-  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
-  if (!(await getSubscriptionFeatureEnabled())) return res.status(409).json({ error: "Subscription feature is currently disabled." });
-  const planId = String(req.body?.planId || req.body?.subscriptionPlanId || "").trim();
-  if (!planId) return res.status(400).json({ error: "A subscription plan is required." });
-
-  await pingDb();
-  if (!dbAvailable) {
-    const allowedClientIds = [...memoryClientIdsForRequest(req)];
-    const clientId = allowedClientIds[0] || String(req.auth.clientId || "").trim();
-    const client = memoryClients.find((item) => item.id === clientId);
-    const plan = memorySubscriptionPlans.find((item) => item.id === planId && item.status === "Active");
-    if (!client) return res.status(404).json({ error: "Customer account was not found." });
-    if (!plan) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-    const startDate = todaySubscriptionDate();
-    const endDate = subscriptionEndDateFor(startDate, plan.billingCycle);
-    client.subscription_plan_id = plan.id;
-    client.subscription_start_date = startDate;
-    client.subscription_end_date = endDate;
-    return res.json({
-      clientId,
-      subscriptionPlanId: plan.id,
-      subscriptionStartDate: startDate,
-      subscriptionEndDate: endDate,
-      plan: normalizeSubscriptionPlan(plan),
-      mode: "memory"
-    });
-  }
-
-  const allowedClientIds = await mysqlClientIdsForRequest(req);
-  const clientId = String(req.auth.clientId || allowedClientIds[0] || "").trim();
-  if (!clientId || !allowedClientIds.includes(clientId)) return res.status(404).json({ error: "Customer account was not found." });
-  const [planRows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? AND status = 'Active' LIMIT 1", [planId]);
-  if (!planRows.length) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-  const plan = normalizeSubscriptionPlan(planRows[0]);
-  const startDate = todaySubscriptionDate();
-  const endDate = subscriptionEndDateFor(startDate, plan.billingCycle);
-  await pool.query(
-    "UPDATE clients SET subscription_plan_id = ?, subscription_start_date = ?, subscription_end_date = ? WHERE id = ?",
-    [plan.id, startDate, endDate, clientId]
-  );
-  res.json({
-    clientId,
-    subscriptionPlanId: plan.id,
-    subscriptionStartDate: startDate,
-    subscriptionEndDate: endDate,
-    plan,
-    mode: "mysql"
-  });
-}));
-
-app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
-  if (denyUnlessAdmin(req, res)) return;
-  const plan = normalizeSubscriptionPlan({ ...req.body, createdBy: req.auth.userId });
-  if (!plan.name) return res.status(400).json({ error: "Plan name is required." });
-  if (!Number.isFinite(plan.price) || plan.price < 0) return res.status(400).json({ error: "Price must be a valid non-negative number." });
-  if (!plan.slug) plan.slug = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
-  if (!plan.slug) return res.status(400).json({ error: "A valid plan name is required." });
-  if (plan.startDate && plan.endDate && plan.endDate < plan.startDate) return res.status(400).json({ error: "End date cannot be before start date." });
-
-  if (!dbAvailable) {
-    if (memorySubscriptionPlans.some((item) => item.slug === plan.slug)) return res.status(409).json({ error: "A plan with this slug already exists." });
-    const saved = { ...plan, createdBy: req.auth.userId, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    memorySubscriptionPlans.unshift(saved);
-    return res.status(201).json({ ...normalizeSubscriptionPlan(saved), mode: "memory" });
-  }
-
-  try {
-    await pool.query(
-      `INSERT INTO subscription_plans
-        (id, name, slug, description, price, billing_cycle, start_date, end_date, max_vehicles, features_json, status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [plan.id, plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.startDate, plan.endDate, plan.maxVehicles, JSON.stringify(plan.features), plan.status, req.auth.userId]
-    );
-  } catch (error) {
-    if (String(error?.code || "") === "ER_DUP_ENTRY") return res.status(409).json({ error: "A plan with this name or slug already exists." });
-    throw error;
-  }
-  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [plan.id]);
-  res.status(201).json({ ...normalizeSubscriptionPlan(rows[0] || plan), mode: "mysql" });
-}));
-
-app.put("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
-  if (denyUnlessAdmin(req, res)) return;
-  const id = String(req.params.id || "").trim();
-  if (!id) return res.status(400).json({ error: "Plan id is required." });
-  const plan = normalizeSubscriptionPlan({ ...req.body, id, createdBy: req.auth.userId });
-  if (!plan.name) return res.status(400).json({ error: "Plan name is required." });
-  if (!Number.isFinite(plan.price) || plan.price < 0) return res.status(400).json({ error: "Price must be a valid non-negative number." });
-  if (!plan.slug) plan.slug = plan.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
-  if (!plan.slug) return res.status(400).json({ error: "A valid plan name is required." });
-  if (plan.startDate && plan.endDate && plan.endDate < plan.startDate) return res.status(400).json({ error: "End date cannot be before start date." });
-
-  if (!dbAvailable) {
-    const index = memorySubscriptionPlans.findIndex((item) => item.id === id);
-    if (index < 0) return res.status(404).json({ error: "Subscription plan not found." });
-    if (memorySubscriptionPlans.some((item) => item.id !== id && item.slug === plan.slug)) return res.status(409).json({ error: "A plan with this slug already exists." });
-    const saved = { ...memorySubscriptionPlans[index], ...plan, id, updatedAt: new Date().toISOString() };
-    memorySubscriptionPlans[index] = saved;
-    return res.json({ ...normalizeSubscriptionPlan(saved), mode: "memory" });
-  }
-
-  try {
-    const [result] = await pool.query(
-      `UPDATE subscription_plans
-       SET name = ?, slug = ?, description = ?, price = ?, billing_cycle = ?, start_date = ?, end_date = ?, max_vehicles = ?, features_json = ?, status = ?
-       WHERE id = ?`,
-      [plan.name, plan.slug, plan.description, plan.price, plan.billingCycle, plan.startDate, plan.endDate, plan.maxVehicles, JSON.stringify(plan.features), plan.status, id]
-    );
-    if (!result.affectedRows) return res.status(404).json({ error: "Subscription plan not found." });
-  } catch (error) {
-    if (String(error?.code || "") === "ER_DUP_ENTRY") return res.status(409).json({ error: "A plan with this slug already exists." });
-    throw error;
-  }
-  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [id]);
-  res.json({ ...normalizeSubscriptionPlan(rows[0] || plan), mode: "mysql" });
-}));
-
-app.delete("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
-  if (denyUnlessAdmin(req, res)) return;
-  const id = String(req.params.id || "").trim();
-  if (!id) return res.status(400).json({ error: "Plan id is required." });
-
-  if (!dbAvailable) {
-    if (!memorySubscriptionPlans.some((plan) => plan.id === id)) return res.status(404).json({ error: "Subscription plan not found." });
-    if (memoryClients.some((client) => client.subscription_plan_id === id)) return res.status(409).json({ error: "This plan is assigned to a client. Reassign that client before deleting the plan." });
-    memorySubscriptionPlans.splice(memorySubscriptionPlans.findIndex((plan) => plan.id === id), 1);
-    return res.json({ ok: true, id, mode: "memory" });
-  }
-
-  const [assignedRows] = await pool.query("SELECT COUNT(*) AS count FROM clients WHERE subscription_plan_id = ?", [id]);
-  if (Number(assignedRows[0]?.count || 0) > 0) {
-    return res.status(409).json({ error: "This plan is assigned to a client. Reassign that client before deleting the plan." });
-  }
-  const [result] = await pool.query("DELETE FROM subscription_plans WHERE id = ?", [id]);
-  if (!result.affectedRows) return res.status(404).json({ error: "Subscription plan not found." });
-  res.json({ ok: true, id, mode: "mysql" });
-}));
-
 app.get("/api/users", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {
@@ -3092,7 +2771,6 @@ app.get("/api/users", asyncHandler(async (req, res) => {
 app.post("/api/users", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
   const { name, email, password: clientPassword } = req.body;
-  const subscriptionPlanId = String(req.body?.subscriptionPlanId || req.body?.subscription_plan_id || "").trim() || null;
   const requestedRole = String(req.body?.role || "Customer");
   const userRole = ["Customer", "Owner", "Caller"].includes(requestedRole) ? requestedRole : "Customer";
   const commonPassword = await getCommonPassword();
@@ -3106,9 +2784,6 @@ app.post("/api/users", asyncHandler(async (req, res) => {
 
   await pingDb();
   if (!dbAvailable) {
-    if (userRole !== "Caller" && subscriptionPlanId && !memorySubscriptionPlans.some((plan) => plan.id === subscriptionPlanId && plan.status !== "Inactive")) {
-      return res.status(400).json({ error: "Selected subscription plan was not found." });
-    }
     if (memoryUsers.some((u) => u.email === lowerEmail)) {
       return res.status(400).json({ error: "Email already exists." });
     }
@@ -3121,23 +2796,14 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       if (existingClient) {
         clientId = existingClient.id;
         existingClient.email = lowerEmail;
-        existingClient.subscription_plan_id = subscriptionPlanId;
-        existingClient.subscription_start_date = null;
-        existingClient.subscription_end_date = null;
       } else {
-        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", subscription_plan_id: subscriptionPlanId, subscription_start_date: null, subscription_end_date: null, caller_id: null, password });
+        memoryClients.push({ id: clientId, name, email: lowerEmail, city: "", phone: "", caller_id: null, password });
       }
     }
-    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "memory" });
+    return res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "memory" });
   }
 
   await ensureClientsEmailColumn();
-  const [planRows] = userRole !== "Caller" && subscriptionPlanId
-    ? await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status <> 'Inactive' LIMIT 1", [subscriptionPlanId])
-    : [[]];
-  if (userRole !== "Caller" && subscriptionPlanId && !planRows.length) {
-    return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-  }
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -3155,11 +2821,11 @@ app.post("/api/users", asyncHandler(async (req, res) => {
       );
       if (existingClients.length) {
         clientId = existingClients[0].id;
-        await conn.query("UPDATE clients SET email = ?, subscription_plan_id = ?, subscription_start_date = NULL, subscription_end_date = NULL WHERE id = ?", [lowerEmail, subscriptionPlanId, clientId]);
+        await conn.query("UPDATE clients SET email = ? WHERE id = ?", [lowerEmail, clientId]);
       } else {
         await conn.query(
-          "INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, caller_id) VALUES (?, ?, ?, '', '', ?, NULL)",
-          [clientId, name, lowerEmail, subscriptionPlanId]
+          "INSERT INTO clients (id, name, email, city, phone, caller_id) VALUES (?, ?, ?, '', '', NULL)",
+          [clientId, name, lowerEmail]
         );
       }
     }
@@ -3170,40 +2836,7 @@ app.post("/api/users", asyncHandler(async (req, res) => {
   } finally {
     conn.release();
   }
-  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, subscriptionPlanId: userRole === "Caller" ? null : subscriptionPlanId, mode: "mysql" });
-}));
-
-// Assign or upgrade a client's subscription from the client profile.
-app.patch("/api/clients/:id/subscription-plan", asyncHandler(async (req, res) => {
-  if (denyUnlessAdmin(req, res)) return;
-  const clientId = String(req.params.id || "").trim();
-  const subscriptionPlanId = String(req.body?.subscriptionPlanId || req.body?.subscription_plan_id || "").trim();
-  const subscriptionStartDate = toMysqlDate(req.body?.subscriptionStartDate ?? req.body?.subscription_start_date);
-  const subscriptionEndDate = toMysqlDate(req.body?.subscriptionEndDate ?? req.body?.subscription_end_date);
-  if (!clientId) return res.status(400).json({ error: "Client id is required." });
-  if (!subscriptionPlanId) return res.status(400).json({ error: "A subscription plan is required." });
-  if (subscriptionStartDate && subscriptionEndDate && subscriptionEndDate < subscriptionStartDate) {
-    return res.status(400).json({ error: "Subscription end date cannot be before the start date." });
-  }
-
-  await pingDb();
-  if (!dbAvailable) {
-    const client = memoryClients.find((item) => item.id === clientId);
-    if (!client) return res.status(404).json({ error: "Client not found." });
-    const plan = memorySubscriptionPlans.find((item) => item.id === subscriptionPlanId && item.status === "Active");
-    if (!plan) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-    client.subscription_plan_id = subscriptionPlanId;
-    client.subscription_start_date = subscriptionStartDate;
-    client.subscription_end_date = subscriptionEndDate;
-    return res.json({ id: clientId, subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, mode: "memory" });
-  }
-
-  const [clientRows] = await pool.query("SELECT id FROM clients WHERE id = ? LIMIT 1", [clientId]);
-  if (!clientRows.length) return res.status(404).json({ error: "Client not found." });
-  const [planRows] = await pool.query("SELECT id FROM subscription_plans WHERE id = ? AND status = 'Active' LIMIT 1", [subscriptionPlanId]);
-  if (!planRows.length) return res.status(400).json({ error: "Selected subscription plan was not found or is inactive." });
-  await pool.query("UPDATE clients SET subscription_plan_id = ?, subscription_start_date = ?, subscription_end_date = ? WHERE id = ?", [subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, clientId]);
-  res.json({ id: clientId, subscriptionPlanId, subscriptionStartDate, subscriptionEndDate, mode: "mysql" });
+  res.status(201).json({ id, name, email: lowerEmail, role: userRole, clientId: userRole === "Caller" ? null : clientId, mode: "mysql" });
 }));
 
 // Delete a client, its customer account and every dependent record.
@@ -4400,18 +4033,15 @@ app.post("/api/sync", asyncHandler(async (req, res) => {
 
     for (const client of safeClients) {
       await conn.query(
-        `INSERT INTO clients (id, name, email, city, phone, subscription_plan_id, subscription_start_date, subscription_end_date, caller_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO clients (id, name, email, city, phone, caller_id)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
            email = VALUES(email),
            city = VALUES(city),
            phone = VALUES(phone),
-           subscription_plan_id = VALUES(subscription_plan_id),
-           subscription_start_date = VALUES(subscription_start_date),
-           subscription_end_date = VALUES(subscription_end_date),
            caller_id = VALUES(caller_id)`,
-        [client.id, client.name, client.email, client.city, client.phone, client.subscription_plan_id, client.subscription_start_date, client.subscription_end_date, client.caller_id]
+        [client.id, client.name, client.email, client.city, client.phone, client.caller_id]
       );
       await ensureCustomerUserForClient(client, conn);
     }

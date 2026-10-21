@@ -178,6 +178,34 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
+-- Subscription workspace records (admin-only workspace)
+CREATE TABLE IF NOT EXISTS subscription_plans (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(160) NOT NULL,
+  price DECIMAL(14,2) DEFAULT 0,
+  billing_cycle VARCHAR(32) DEFAULT 'Monthly',
+  included_vehicles INT DEFAULT 0,
+  extra_vehicle_price DECIMAL(14,2) DEFAULT 0,
+  pricing_tiers_json LONGTEXT,
+  description TEXT,
+  features_json LONGTEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS subscription_subscribers (
+  id VARCHAR(64) PRIMARY KEY,
+  customer_id VARCHAR(32) NOT NULL,
+  plan_id VARCHAR(64) NOT NULL,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_subscription_subscribers_customer (customer_id),
+  INDEX idx_subscription_subscribers_plan (plan_id),
+  FOREIGN KEY (customer_id) REFERENCES clients(id) ON DELETE CASCADE
+);
+
 -- Detailed customer Excel uploads used by web, admin app and customer app
 CREATE TABLE IF NOT EXISTS client_imports (
   id VARCHAR(64) PRIMARY KEY,

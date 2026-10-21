@@ -205,6 +205,9 @@ const memorySaleClosings = [];
 const memoryMarketplaceInterests = [];
 const memoryMarketplaceThreads = [];
 const memoryWhatsAppLogs = [];
+const memorySubscriptionPlans = [];
+const memorySubscriptionSubscribers = [];
+let memorySubscriptionPayment = { paymentLink: "", qrCodeUrl: "" };
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -1696,6 +1699,7 @@ async function ensureCoreTables() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   );
+  await ensureSubscriptionTables();
   await ensureClientsEmailColumn();
   await ensureUsersMobileColumn();
   await ensureClientImportsTable();
@@ -1706,6 +1710,38 @@ async function ensureCoreTables() {
   await ensureWhatsAppMessagesTable();
   await loadReminderSettingsFromDatabase();
   await ensureAdminUser();
+}
+
+async function ensureSubscriptionTables() {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS subscription_plans (
+      id VARCHAR(64) PRIMARY KEY,
+      name VARCHAR(160) NOT NULL,
+      price DECIMAL(14,2) DEFAULT 0,
+      billing_cycle VARCHAR(32) DEFAULT 'Monthly',
+      included_vehicles INT DEFAULT 0,
+      extra_vehicle_price DECIMAL(14,2) DEFAULT 0,
+      pricing_tiers_json LONGTEXT,
+      description TEXT,
+      features_json LONGTEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS subscription_subscribers (
+      id VARCHAR(64) PRIMARY KEY,
+      customer_id VARCHAR(32) NOT NULL,
+      plan_id VARCHAR(64) NOT NULL,
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_subscription_subscribers_customer (customer_id),
+      INDEX idx_subscription_subscribers_plan (plan_id),
+      FOREIGN KEY (customer_id) REFERENCES clients(id) ON DELETE CASCADE
+    )`
+  );
 }
 
 async function ensureVehicleFinanceColumns(conn = null) {
@@ -3171,6 +3207,171 @@ app.post("/api/change-password", asyncHandler(async (req, res) => {
 }));
 
 // ─── Clients ──────────────────────────────────────────────
+function parseSubscriptionJson(value, fallback) {
+  if (!value) return fallback;
+  if (typeof value !== "string") return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function subscriptionPlanResponse(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    price: Number(row.price || 0),
+    billingCycle: row.billing_cycle || "Monthly",
+    includedVehicles: Number(row.included_vehicles || 0),
+    extraVehiclePrice: Number(row.extra_vehicle_price || 0),
+    pricingTiers: parseSubscriptionJson(row.pricing_tiers_json, []),
+    description: row.description || "",
+    features: parseSubscriptionJson(row.features_json, []),
+    createdAt: row.created_at
+  };
+}
+
+function subscriptionSubscriberResponse(row) {
+  return {
+    id: row.id,
+    customerId: row.customer_id,
+    planId: row.plan_id,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    createdAt: row.created_at
+  };
+}
+
+function normalizeSubscriptionPlan(input = {}) {
+  const id = String(input.id || "").trim();
+  const name = String(input.name || "").trim();
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    price: Math.max(0, Number(input.price || 0)),
+    billingCycle: String(input.billingCycle || "Monthly"),
+    includedVehicles: Math.max(0, Number(input.includedVehicles || 0)),
+    extraVehiclePrice: Math.max(0, Number(input.extraVehiclePrice || 0)),
+    pricingTiers: Array.isArray(input.pricingTiers) ? input.pricingTiers : [],
+    description: String(input.description || ""),
+    features: Array.isArray(input.features) ? input.features.map((item) => String(item)).filter(Boolean) : []
+  };
+}
+
+function normalizeSubscriptionDate(value) {
+  const date = String(value || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
+}
+
+// Subscription workspace records are admin-only and persisted in MySQL.
+app.get("/api/subscriptions", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  await pingDb();
+  if (!dbAvailable) {
+    return res.json({ plans: memorySubscriptionPlans, subscribers: memorySubscriptionSubscribers, paymentDetails: memorySubscriptionPayment, mode: "memory" });
+  }
+  const [planRows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at, id");
+  const [subscriberRows] = await pool.query("SELECT * FROM subscription_subscribers ORDER BY created_at DESC");
+  const [settingRows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_payment' LIMIT 1");
+  const paymentDetails = settingRows.length ? parseSubscriptionJson(settingRows[0].setting_value, {}) : {};
+  res.json({
+    plans: planRows.map(subscriptionPlanResponse),
+    subscribers: subscriberRows.map(subscriptionSubscriberResponse),
+    paymentDetails: { paymentLink: paymentDetails.paymentLink || "", qrCodeUrl: paymentDetails.qrCodeUrl || "" },
+    mode: "mysql"
+  });
+}));
+
+app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const plan = normalizeSubscriptionPlan(req.body);
+  if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
+  await pingDb();
+  if (!dbAvailable) {
+    const index = memorySubscriptionPlans.findIndex((item) => item.id === plan.id);
+    if (index >= 0) memorySubscriptionPlans[index] = plan;
+    else memorySubscriptionPlans.push(plan);
+    return res.status(201).json(plan);
+  }
+  await pool.query(
+    `INSERT INTO subscription_plans (id, name, price, billing_cycle, included_vehicles, extra_vehicle_price, pricing_tiers_json, description, features_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE name = VALUES(name), price = VALUES(price), billing_cycle = VALUES(billing_cycle), included_vehicles = VALUES(included_vehicles), extra_vehicle_price = VALUES(extra_vehicle_price), pricing_tiers_json = VALUES(pricing_tiers_json), description = VALUES(description), features_json = VALUES(features_json)`,
+    [plan.id, plan.name, plan.price, plan.billingCycle, plan.includedVehicles, plan.extraVehiclePrice, JSON.stringify(plan.pricingTiers), plan.description, JSON.stringify(plan.features)]
+  );
+  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [plan.id]);
+  res.status(201).json(subscriptionPlanResponse(rows[0]));
+}));
+
+app.delete("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  await pingDb();
+  if (!dbAvailable) {
+    const index = memorySubscriptionPlans.findIndex((item) => item.id === req.params.id);
+    if (index >= 0) memorySubscriptionPlans.splice(index, 1);
+    return res.json({ ok: true, id: req.params.id, mode: "memory" });
+  }
+  await pool.query("DELETE FROM subscription_plans WHERE id = ?", [req.params.id]);
+  res.json({ ok: true, id: req.params.id, mode: "mysql" });
+}));
+
+app.post("/api/subscription-subscribers", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const id = String(req.body?.id || "").trim();
+  const customerId = String(req.body?.customerId || "").trim();
+  const planId = String(req.body?.planId || "").trim();
+  const startDate = normalizeSubscriptionDate(req.body?.startDate);
+  const endDate = normalizeSubscriptionDate(req.body?.endDate);
+  if (!id || !customerId || !planId || !startDate || !endDate) return res.status(400).json({ error: "Subscriber, plan, start date and expiry date are required." });
+  await pingDb();
+  if (!dbAvailable) {
+    const item = { id, customerId, planId, startDate, endDate, createdAt: new Date().toISOString() };
+    const index = memorySubscriptionSubscribers.findIndex((row) => row.id === id);
+    if (index >= 0) memorySubscriptionSubscribers[index] = item;
+    else memorySubscriptionSubscribers.unshift(item);
+    return res.status(201).json(item);
+  }
+  const [customerRows] = await pool.query("SELECT id FROM clients WHERE id = ? LIMIT 1", [customerId]);
+  if (!customerRows.length) return res.status(400).json({ error: "Customer not found." });
+  const [planRows] = await pool.query("SELECT id FROM subscription_plans WHERE id = ? LIMIT 1", [planId]);
+  if (!planRows.length) return res.status(400).json({ error: "Plan not found." });
+  await pool.query(
+    `INSERT INTO subscription_subscribers (id, customer_id, plan_id, start_date, end_date)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE customer_id = VALUES(customer_id), plan_id = VALUES(plan_id), start_date = VALUES(start_date), end_date = VALUES(end_date)`,
+    [id, customerId, planId, startDate, endDate]
+  );
+  const [rows] = await pool.query("SELECT * FROM subscription_subscribers WHERE id = ?", [id]);
+  res.status(201).json(subscriptionSubscriberResponse(rows[0]));
+}));
+
+app.delete("/api/subscription-subscribers/:id", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  await pingDb();
+  if (!dbAvailable) {
+    const index = memorySubscriptionSubscribers.findIndex((item) => item.id === req.params.id);
+    if (index >= 0) memorySubscriptionSubscribers.splice(index, 1);
+    return res.json({ ok: true, id: req.params.id, mode: "memory" });
+  }
+  await pool.query("DELETE FROM subscription_subscribers WHERE id = ?", [req.params.id]);
+  res.json({ ok: true, id: req.params.id, mode: "mysql" });
+}));
+
+app.put("/api/subscription-payment", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  const paymentDetails = { paymentLink: String(req.body?.paymentLink || "").trim(), qrCodeUrl: String(req.body?.qrCodeUrl || "").trim() };
+  await pingDb();
+  if (!dbAvailable) {
+    memorySubscriptionPayment = paymentDetails;
+    return res.json({ ...paymentDetails, mode: "memory" });
+  }
+  await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_payment', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)", [JSON.stringify(paymentDetails)]);
+  res.json({ ...paymentDetails, mode: "mysql" });
+}));
+
 app.get("/api/clients", asyncHandler(async (req, res) => {
   await pingDb();
   if (!dbAvailable) {

@@ -1728,6 +1728,26 @@ async function ensureSubscriptionTables() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   );
+  // Older deployments created subscription_plans before the tiered-pricing
+  // fields were introduced. Add missing columns in-place so existing plans
+  // remain available and the API can start without a manual SQL migration.
+  const planColumns = [
+    ["included_vehicles", "INT DEFAULT 0"],
+    ["extra_vehicle_price", "DECIMAL(14,2) DEFAULT 0"],
+    ["pricing_tiers_json", "LONGTEXT NULL"],
+    ["description", "TEXT NULL"],
+    ["features_json", "LONGTEXT NULL"],
+    ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"]
+  ];
+  for (const [name, definition] of planColumns) {
+    try {
+      await pool.query(`ALTER TABLE subscription_plans ADD COLUMN ${name} ${definition}`);
+    } catch (error) {
+      const message = String(error?.message || "").toLowerCase();
+      if (!message.includes("duplicate column")) throw error;
+    }
+  }
   await pool.query(
     `CREATE TABLE IF NOT EXISTS subscription_subscribers (
       id VARCHAR(64) PRIMARY KEY,

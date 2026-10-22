@@ -1728,26 +1728,7 @@ async function ensureSubscriptionTables() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )`
   );
-  // Older deployments created subscription_plans before the tiered-pricing
-  // fields were introduced. Add missing columns in-place so existing plans
-  // remain available and the API can start without a manual SQL migration.
-  const planColumns = [
-    ["included_vehicles", "INT DEFAULT 0"],
-    ["extra_vehicle_price", "DECIMAL(14,2) DEFAULT 0"],
-    ["pricing_tiers_json", "LONGTEXT NULL"],
-    ["description", "TEXT NULL"],
-    ["features_json", "LONGTEXT NULL"],
-    ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
-    ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"]
-  ];
-  for (const [name, definition] of planColumns) {
-    try {
-      await pool.query(`ALTER TABLE subscription_plans ADD COLUMN ${name} ${definition}`);
-    } catch (error) {
-      const message = String(error?.message || "").toLowerCase();
-      if (!message.includes("duplicate column")) throw error;
-    }
-  }
+  await ensureSubscriptionPlanColumns();
   await pool.query(
     `CREATE TABLE IF NOT EXISTS subscription_subscribers (
       id VARCHAR(64) PRIMARY KEY,
@@ -1762,6 +1743,29 @@ async function ensureSubscriptionTables() {
       FOREIGN KEY (customer_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
+}
+
+async function ensureSubscriptionPlanColumns() {
+  const [rows] = await pool.query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'subscription_plans'`
+  );
+  const existingColumns = new Set(rows.map((row) => String(row.COLUMN_NAME).toLowerCase()));
+  const planColumns = [
+    ["included_vehicles", "INT DEFAULT 0"],
+    ["extra_vehicle_price", "DECIMAL(14,2) DEFAULT 0"],
+    ["pricing_tiers_json", "LONGTEXT NULL"],
+    ["description", "TEXT NULL"],
+    ["features_json", "LONGTEXT NULL"],
+    ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
+    ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"]
+  ];
+  for (const [name, definition] of planColumns) {
+    if (existingColumns.has(name)) continue;
+    await pool.query(`ALTER TABLE subscription_plans ADD COLUMN ${name} ${definition}`);
+    existingColumns.add(name);
+  }
 }
 
 async function ensureVehicleFinanceColumns(conn = null) {
@@ -3293,6 +3297,7 @@ app.get("/api/subscriptions", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     return res.json({ plans: memorySubscriptionPlans, subscribers: memorySubscriptionSubscribers, paymentDetails: memorySubscriptionPayment, mode: "memory" });
   }
+  await ensureSubscriptionPlanColumns();
   const [planRows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at, id");
   const [subscriberRows] = await pool.query("SELECT * FROM subscription_subscribers ORDER BY created_at DESC");
   const [settingRows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_payment' LIMIT 1");
@@ -3307,15 +3312,18 @@ app.get("/api/subscriptions", asyncHandler(async (req, res) => {
 
 app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
-  const plan = normalizeSubscriptionPlan(req.body);
-  if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
   await pingDb();
   if (!dbAvailable) {
+    const plan = normalizeSubscriptionPlan(req.body);
+    if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
     const index = memorySubscriptionPlans.findIndex((item) => item.id === plan.id);
     if (index >= 0) memorySubscriptionPlans[index] = plan;
     else memorySubscriptionPlans.push(plan);
     return res.status(201).json(plan);
   }
+  await ensureSubscriptionPlanColumns();
+  const plan = normalizeSubscriptionPlan(req.body);
+  if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
   await pool.query(
     `INSERT INTO subscription_plans (id, name, price, billing_cycle, included_vehicles, extra_vehicle_price, pricing_tiers_json, description, features_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3334,6 +3342,7 @@ app.delete("/api/subscription-plans/:id", asyncHandler(async (req, res) => {
     if (index >= 0) memorySubscriptionPlans.splice(index, 1);
     return res.json({ ok: true, id: req.params.id, mode: "memory" });
   }
+  await ensureSubscriptionPlanColumns();
   await pool.query("DELETE FROM subscription_plans WHERE id = ?", [req.params.id]);
   res.json({ ok: true, id: req.params.id, mode: "mysql" });
 }));

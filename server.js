@@ -1757,15 +1757,20 @@ async function ensureSubscriptionPlanColumns() {
     ["extra_vehicle_price", "DECIMAL(14,2) DEFAULT 0"],
     ["pricing_tiers_json", "LONGTEXT NULL"],
     ["description", "TEXT NULL"],
-    ["features_json", "LONGTEXT NULL"],
-    ["created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"],
-    ["updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"]
+    ["features_json", "LONGTEXT NULL"]
   ];
   for (const [name, definition] of planColumns) {
     if (existingColumns.has(name)) continue;
-    await pool.query(`ALTER TABLE subscription_plans ADD COLUMN ${name} ${definition}`);
-    existingColumns.add(name);
+    try {
+      await pool.query(`ALTER TABLE subscription_plans ADD COLUMN ${name} ${definition}`);
+      existingColumns.add(name);
+    } catch (error) {
+      // Some managed MySQL users can read/write rows but cannot ALTER tables.
+      // Keep the API alive; write routes below use the columns that exist.
+      console.warn(`[subscription-schema] Could not add ${name}: ${error?.message || error}`);
+    }
   }
+  return existingColumns;
 }
 
 async function ensureVehicleFinanceColumns(conn = null) {
@@ -3297,8 +3302,9 @@ app.get("/api/subscriptions", asyncHandler(async (req, res) => {
   if (!dbAvailable) {
     return res.json({ plans: memorySubscriptionPlans, subscribers: memorySubscriptionSubscribers, paymentDetails: memorySubscriptionPayment, mode: "memory" });
   }
-  await ensureSubscriptionPlanColumns();
-  const [planRows] = await pool.query("SELECT * FROM subscription_plans ORDER BY created_at, id");
+  const planColumns = await ensureSubscriptionPlanColumns();
+  const planOrderColumn = planColumns.has("created_at") ? "created_at" : "id";
+  const [planRows] = await pool.query(`SELECT * FROM subscription_plans ORDER BY ${planOrderColumn}, id`);
   const [subscriberRows] = await pool.query("SELECT * FROM subscription_subscribers ORDER BY created_at DESC");
   const [settingRows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_payment' LIMIT 1");
   const paymentDetails = settingRows.length ? parseSubscriptionJson(settingRows[0].setting_value, {}) : {};
@@ -3321,14 +3327,28 @@ app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
     else memorySubscriptionPlans.push(plan);
     return res.status(201).json(plan);
   }
-  await ensureSubscriptionPlanColumns();
+  const planColumns = await ensureSubscriptionPlanColumns();
   const plan = normalizeSubscriptionPlan(req.body);
   if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
+  const planValues = [
+    ["id", plan.id],
+    ["name", plan.name],
+    ["price", plan.price],
+    ["billing_cycle", plan.billingCycle],
+    ["included_vehicles", plan.includedVehicles],
+    ["extra_vehicle_price", plan.extraVehiclePrice],
+    ["pricing_tiers_json", JSON.stringify(plan.pricingTiers)],
+    ["description", plan.description],
+    ["features_json", JSON.stringify(plan.features)]
+  ].filter(([column]) => planColumns.has(column));
+  const insertColumns = planValues.map(([column]) => column);
+  const updateColumns = insertColumns.filter((column) => column !== "id");
+  const updateSql = updateColumns.length
+    ? ` ON DUPLICATE KEY UPDATE ${updateColumns.map((column) => `${column} = VALUES(${column})`).join(", ")}`
+    : "";
   await pool.query(
-    `INSERT INTO subscription_plans (id, name, price, billing_cycle, included_vehicles, extra_vehicle_price, pricing_tiers_json, description, features_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE name = VALUES(name), price = VALUES(price), billing_cycle = VALUES(billing_cycle), included_vehicles = VALUES(included_vehicles), extra_vehicle_price = VALUES(extra_vehicle_price), pricing_tiers_json = VALUES(pricing_tiers_json), description = VALUES(description), features_json = VALUES(features_json)`,
-    [plan.id, plan.name, plan.price, plan.billingCycle, plan.includedVehicles, plan.extraVehiclePrice, JSON.stringify(plan.pricingTiers), plan.description, JSON.stringify(plan.features)]
+    `INSERT INTO subscription_plans (${insertColumns.join(", ")}) VALUES (${insertColumns.map(() => "?").join(", ")})${updateSql}`,
+    planValues.map(([, value]) => value)
   );
   const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ?", [plan.id]);
   res.status(201).json(subscriptionPlanResponse(rows[0]));

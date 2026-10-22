@@ -246,6 +246,30 @@ function currentReminderSettings() {
   return reminderSettingsStore;
 }
 
+async function upsertSetting(settingKey, settingValue) {
+  const [columns] = await pool.query(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'settings'`
+  );
+  const available = new Set(columns.map((row) => String(row.COLUMN_NAME).toLowerCase()));
+  const insertColumns = ["setting_key", "setting_value"];
+  const values = [settingKey, settingValue];
+  // Some older deployments added a required slug column to settings.
+  // Preserve compatibility without requiring a destructive table change.
+  if (available.has("slug")) {
+    insertColumns.push("slug");
+    values.push(settingKey);
+  }
+  const updateSql = available.has("setting_key")
+    ? " ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)"
+    : "";
+  await pool.query(
+    `INSERT INTO settings (${insertColumns.join(", ")}) VALUES (${insertColumns.map(() => "?").join(", ")})${updateSql}`,
+    values
+  );
+}
+
 async function loadReminderSettingsFromDatabase() {
   try {
     const [rows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'reminder_settings' LIMIT 1");
@@ -255,10 +279,7 @@ async function loadReminderSettingsFromDatabase() {
         return reminderSettingsStore;
       } catch { /* use defaults when the stored value is invalid */ }
     }
-    await pool.query(
-      "INSERT INTO settings (setting_key, setting_value) VALUES ('reminder_settings', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
-      [JSON.stringify(reminderSettingsStore)]
-    );
+    await upsertSetting("reminder_settings", JSON.stringify(reminderSettingsStore));
   } catch { /* settings are optional while the database is unavailable */ }
   return reminderSettingsStore;
 }
@@ -2724,10 +2745,7 @@ app.put("/api/reminder-settings", asyncHandler(async (req, res) => {
   reminderSettingsStore = nextSettings;
   if (dbAvailable) {
     try {
-      await pool.query(
-        "INSERT INTO settings (setting_key, setting_value) VALUES ('reminder_settings', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
-        [JSON.stringify(nextSettings)]
-      );
+      await upsertSetting("reminder_settings", JSON.stringify(nextSettings));
     } catch { /* keep runtime settings when the optional settings table is unavailable */ }
   }
   startDueDateMonitor();
@@ -2764,9 +2782,7 @@ app.put("/api/common-password", asyncHandler(async (req, res) => {
   commonPasswordStore = String(password).trim();
   commonCustomerPassword = commonPasswordStore;
   if (dbAvailable) {
-    try {
-      await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('common_customer_password', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)", [commonPasswordStore]);
-    } catch { /* table may not exist */ }
+    try { await upsertSetting("common_customer_password", commonPasswordStore); } catch { /* table may not exist */ }
   }
   res.json({ ok: true, commonPassword: commonPasswordStore });
 }));
@@ -2815,10 +2831,7 @@ app.put("/api/permissions", asyncHandler(async (req, res) => {
   rolePermissionsStore = sanitized;
   if (dbAvailable) {
     try {
-      await pool.query(
-        "INSERT INTO settings (setting_key, setting_value) VALUES ('role_permissions', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)",
-        [JSON.stringify(rolePermissionsStore)]
-      );
+      await upsertSetting("role_permissions", JSON.stringify(rolePermissionsStore));
     } catch { /* table may not exist */ }
   }
   res.json({ ok: true, rolePermissions: rolePermissionsStore });
@@ -3250,6 +3263,7 @@ function parseSubscriptionJson(value, fallback) {
 function subscriptionPlanResponse(row) {
   return {
     id: row.id,
+    slug: row.slug || row.id,
     name: row.name,
     price: Number(row.price || 0),
     billingCycle: row.billing_cycle || "Monthly",
@@ -3279,6 +3293,7 @@ function normalizeSubscriptionPlan(input = {}) {
   if (!id || !name) return null;
   return {
     id,
+    slug: String(input.slug || id).trim(),
     name,
     price: Math.max(0, Number(input.price || 0)),
     billingCycle: String(input.billingCycle || "Monthly"),
@@ -3332,6 +3347,7 @@ app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   if (!plan) return res.status(400).json({ error: "Plan name and id are required." });
   const planValues = [
     ["id", plan.id],
+    ["slug", plan.slug],
     ["name", plan.name],
     ["price", plan.price],
     ["billing_cycle", plan.billingCycle],
@@ -3417,7 +3433,7 @@ app.put("/api/subscription-payment", asyncHandler(async (req, res) => {
     memorySubscriptionPayment = paymentDetails;
     return res.json({ ...paymentDetails, mode: "memory" });
   }
-  await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('subscription_payment', ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)", [JSON.stringify(paymentDetails)]);
+  await upsertSetting("subscription_payment", JSON.stringify(paymentDetails));
   res.json({ ...paymentDetails, mode: "mysql" });
 }));
 
@@ -4116,10 +4132,7 @@ app.put("/api/whatsapp-templates", asyncHandler(async (req, res) => {
   whatsappTemplatesStore = templates;
   await pingDb();
   if (dbAvailable) {
-    await pool.query(
-      "REPLACE INTO settings (setting_key, setting_value) VALUES ('whatsapp_templates', ?)",
-      [JSON.stringify(templates)]
-    );
+    await upsertSetting("whatsapp_templates", JSON.stringify(templates));
   }
   res.json({ ok: true, templates });
 }));

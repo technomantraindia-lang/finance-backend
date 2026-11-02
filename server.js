@@ -3331,6 +3331,70 @@ app.get("/api/subscriptions", asyncHandler(async (req, res) => {
   });
 }));
 
+// Customers only need their own subscription status so the portal can lock
+// expired accounts without exposing the admin subscription workspace.
+app.get("/api/subscriptions/me", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
+  await pingDb();
+
+  if (!dbAvailable) {
+    const allowedClientIds = memoryClientIdsForRequest(req);
+    const subscriber = memorySubscriptionSubscribers
+      .filter((item) => allowedClientIds.has(item.customerId))
+      .sort((first, second) => String(second.endDate || "").localeCompare(String(first.endDate || "")))[0] || null;
+    const plan = subscriber ? memorySubscriptionPlans.find((item) => item.id === subscriber.planId) || null : null;
+    return res.json({
+      subscription: subscriber,
+      plan,
+      paymentDetails: memorySubscriptionPayment,
+      mode: "memory"
+    });
+  }
+
+  const clientIds = await mysqlClientIdsForRequest(req);
+  let subscription = null;
+  let plan = null;
+  if (clientIds.length) {
+    const placeholders = clientIds.map(() => "?").join(",");
+    const [rows] = await pool.query(
+      `SELECT s.*, p.id AS plan_id_value, p.name AS plan_name, p.price,
+          p.billing_cycle, p.included_vehicles, p.extra_vehicle_price,
+          p.pricing_tiers_json, p.description, p.features_json, p.created_at AS plan_created_at
+       FROM subscription_subscribers s
+       LEFT JOIN subscription_plans p ON p.id = s.plan_id
+       WHERE s.customer_id IN (${placeholders})
+       ORDER BY s.end_date DESC, s.created_at DESC
+       LIMIT 1`,
+      clientIds
+    );
+    if (rows.length) {
+      subscription = subscriptionSubscriberResponse(rows[0]);
+      plan = rows[0].plan_id_value ? subscriptionPlanResponse({
+        id: rows[0].plan_id_value,
+        slug: rows[0].plan_id_value,
+        name: rows[0].plan_name,
+        price: rows[0].price,
+        billing_cycle: rows[0].billing_cycle,
+        included_vehicles: rows[0].included_vehicles,
+        extra_vehicle_price: rows[0].extra_vehicle_price,
+        pricing_tiers_json: rows[0].pricing_tiers_json,
+        description: rows[0].description,
+        features_json: rows[0].features_json,
+        created_at: rows[0].plan_created_at
+      }) : null;
+    }
+  }
+
+  const [settingRows] = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'subscription_payment' LIMIT 1");
+  const paymentDetails = settingRows.length ? parseSubscriptionJson(settingRows[0].setting_value, {}) : {};
+  res.json({
+    subscription,
+    plan,
+    paymentDetails: { paymentLink: paymentDetails.paymentLink || "", qrCodeUrl: paymentDetails.qrCodeUrl || "" },
+    mode: "mysql"
+  });
+}));
+
 app.post("/api/subscription-plans", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
   await pingDb();

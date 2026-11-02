@@ -219,6 +219,7 @@ const memorySubscriptionPlans = [];
 const memorySubscriptionSubscribers = [];
 let memorySubscriptionPayment = { paymentLink: "", qrCodeUrl: "" };
 const memorySubscriptionPayments = new Set();
+const memorySubscriptionPaymentLinks = [];
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -1787,6 +1788,21 @@ async function ensureSubscriptionTables() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_subscription_payments_order (order_id),
       INDEX idx_subscription_payments_customer (customer_id)
+    )`
+  );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS subscription_payment_links (
+      payment_link_id VARCHAR(64) PRIMARY KEY,
+      customer_id VARCHAR(32) NOT NULL,
+      plan_id VARCHAR(64) NOT NULL,
+      amount INT NOT NULL,
+      status VARCHAR(24) NOT NULL DEFAULT 'created',
+      short_url VARCHAR(255),
+      payload_json LONGTEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_subscription_payment_links_customer (customer_id),
+      INDEX idx_subscription_payment_links_status (status)
     )`
   );
 }
@@ -3424,6 +3440,148 @@ async function customerVehicleCountForSubscription(clientIds) {
   return Number(rows[0]?.vehicle_count || 0);
 }
 
+async function subscriptionCustomerForPaymentLink(customerId) {
+  if (!dbAvailable) {
+    return memoryClients.find((client) => String(client.id) === String(customerId)) || null;
+  }
+  const [rows] = await pool.query(
+    "SELECT id, name, email, phone FROM clients WHERE id = ? LIMIT 1",
+    [customerId]
+  );
+  return rows[0] || null;
+}
+
+async function rememberSubscriptionPaymentLink(paymentLink) {
+  const record = {
+    paymentLinkId: String(paymentLink.id || "").trim(),
+    customerId: String(paymentLink.customerId || "").trim(),
+    planId: String(paymentLink.planId || "").trim(),
+    amount: Number(paymentLink.amount || 0),
+    status: String(paymentLink.status || "created").trim(),
+    shortUrl: String(paymentLink.shortUrl || "").trim(),
+    payload: paymentLink.payload || {}
+  };
+  if (!record.paymentLinkId || !record.customerId || !record.planId) return;
+  if (!dbAvailable) {
+    const index = memorySubscriptionPaymentLinks.findIndex((item) => item.paymentLinkId === record.paymentLinkId);
+    if (index >= 0) memorySubscriptionPaymentLinks[index] = { ...memorySubscriptionPaymentLinks[index], ...record };
+    else memorySubscriptionPaymentLinks.unshift(record);
+    return;
+  }
+  await pool.query(
+    `INSERT INTO subscription_payment_links
+      (payment_link_id, customer_id, plan_id, amount, status, short_url, payload_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE status = VALUES(status), short_url = VALUES(short_url), payload_json = VALUES(payload_json)`,
+    [record.paymentLinkId, record.customerId, record.planId, record.amount, record.status, record.shortUrl, JSON.stringify(record.payload)]
+  );
+}
+
+async function markSubscriptionPaymentLinkPaid(paymentLinkId, payload) {
+  const id = String(paymentLinkId || "").trim();
+  if (!id) return;
+  if (!dbAvailable) {
+    const item = memorySubscriptionPaymentLinks.find((entry) => entry.paymentLinkId === id);
+    if (item) {
+      item.status = "paid";
+      item.payload = payload || item.payload;
+    }
+    return;
+  }
+  await pool.query(
+    "UPDATE subscription_payment_links SET status = 'paid', payload_json = ? WHERE payment_link_id = ?",
+    [JSON.stringify(payload || {}), id]
+  );
+}
+
+async function reusableSubscriptionPaymentLink(customerId, planId, amount) {
+  const customerKey = String(customerId || "").trim();
+  const planKey = String(planId || "").trim();
+  const expectedAmount = Number(amount || 0);
+  if (!customerKey || !planKey || expectedAmount <= 0) return null;
+
+  let records = [];
+  if (!dbAvailable) {
+    records = memorySubscriptionPaymentLinks
+      .filter((item) => item.customerId === customerKey && item.planId === planKey && ["created", "partially_paid"].includes(String(item.status).toLowerCase()))
+      .slice(0, 5);
+  } else {
+    const [rows] = await pool.query(
+      `SELECT payment_link_id, customer_id, plan_id, amount, status, short_url
+       FROM subscription_payment_links
+       WHERE customer_id = ? AND plan_id = ? AND status IN ('created', 'partially_paid')
+       ORDER BY created_at DESC LIMIT 5`,
+      [customerKey, planKey]
+    );
+    records = rows;
+  }
+
+  for (const record of records) {
+    const paymentLinkId = String(record.paymentLinkId || record.payment_link_id || "").trim();
+    if (!paymentLinkId) continue;
+    let paymentLink;
+    try {
+      paymentLink = await razorpayRequest(`/payment_links/${encodeURIComponent(paymentLinkId)}`);
+    } catch (error) {
+      console.warn("Existing Razorpay Payment Link check failed", error.message || error);
+      continue;
+    }
+    const remoteStatus = String(paymentLink.status || "").toLowerCase();
+    if (remoteStatus === "paid" || Number(paymentLink.amount_paid || 0) >= Number(paymentLink.amount || record.amount || 0)) continue;
+    if (!["created", "partially_paid"].includes(remoteStatus)) continue;
+    if (Number(paymentLink.amount || record.amount || 0) !== expectedAmount) continue;
+    const shortUrl = String(paymentLink.short_url || record.short_url || "").trim();
+    if (!shortUrl) continue;
+    return {
+      id: paymentLink.id || paymentLinkId,
+      shortUrl,
+      amount: Number(paymentLink.amount || record.amount || 0),
+      currency: paymentLink.currency || "INR"
+    };
+  }
+  return null;
+}
+
+async function syncPaidPaymentLinksForCustomer(customerId) {
+  if (!razorpayConfigured()) return null;
+  const id = String(customerId || "").trim();
+  if (!id) return null;
+  let records = [];
+  if (!dbAvailable) {
+    records = memorySubscriptionPaymentLinks.filter((item) => item.customerId === id && !["paid", "cancelled", "expired"].includes(item.status)).slice(0, 10);
+  } else {
+    const [rows] = await pool.query(
+      `SELECT payment_link_id, customer_id, plan_id, amount, status, payload_json
+       FROM subscription_payment_links
+       WHERE customer_id = ? AND status NOT IN ('paid', 'cancelled', 'expired')
+       ORDER BY created_at DESC LIMIT 10`,
+      [id]
+    );
+    records = rows;
+  }
+  for (const record of records) {
+    const paymentLinkId = String(record.paymentLinkId || record.payment_link_id || "").trim();
+    if (!paymentLinkId) continue;
+    const paymentLink = await razorpayRequest(`/payment_links/${encodeURIComponent(paymentLinkId)}`);
+    const isPaid = String(paymentLink.status || "").toLowerCase() === "paid"
+      || Number(paymentLink.amount_paid || 0) >= Number(paymentLink.amount || record.amount || 0);
+    if (!isPaid) continue;
+    const paymentId = String(paymentLink.payments?.[0]?.payment_id || paymentLink.payment_id || "").trim();
+    if (!paymentId) continue;
+    const result = await activateSubscriptionFromPayment({
+      paymentId,
+      orderId: String(paymentLink.order_id || paymentLinkId),
+      customerId: id,
+      planId: String(record.planId || record.plan_id || paymentLink.notes?.planId || "").trim(),
+      source: "payment_link_poll",
+      payload: paymentLink
+    });
+    await markSubscriptionPaymentLinkPaid(paymentLinkId, paymentLink);
+    return result;
+  }
+  return null;
+}
+
 async function activateSubscriptionFromPayment({ paymentId, orderId, customerId, planId, source, payload }) {
   const today = subscriptionToday();
   const plan = await subscriptionPlanForCheckout(planId);
@@ -3524,6 +3682,11 @@ app.get("/api/subscriptions/me", asyncHandler(async (req, res) => {
   let subscription = null;
   let plan = null;
   if (clientIds.length) {
+    try {
+      await syncPaidPaymentLinksForCustomer(clientIds[0]);
+    } catch (error) {
+      console.warn("Paid Razorpay Payment Link sync failed", error.message || error);
+    }
     const placeholders = clientIds.map(() => "?").join(",");
     const [rows] = await pool.query(
       `SELECT s.*, p.id AS plan_id_value, p.name AS plan_name, p.price,
@@ -3601,6 +3764,90 @@ app.post("/api/subscriptions/checkout", asyncHandler(async (req, res) => {
   });
 }));
 
+// Create a customer-specific Razorpay Payment Link for admin WhatsApp sharing.
+// The app customer and plan IDs are stored in Razorpay notes so the paid-link
+// webhook can renew the correct subscription automatically.
+app.post("/api/subscriptions/payment-link", asyncHandler(async (req, res) => {
+  if (denyUnlessAdmin(req, res)) return;
+  if (!razorpayConfigured()) return res.status(503).json({ error: "Razorpay test keys are not configured on the backend." });
+  const customerId = String(req.body?.customerId || "").trim();
+  let planId = String(req.body?.planId || "").trim();
+  if (!customerId) return res.status(400).json({ error: "Customer is required." });
+  await pingDb();
+  const customer = await subscriptionCustomerForPaymentLink(customerId);
+  if (!customer) return res.status(404).json({ error: "Customer not found." });
+  if (!planId) {
+    if (dbAvailable) {
+      const [rows] = await pool.query(
+        "SELECT plan_id FROM subscription_subscribers WHERE customer_id = ? ORDER BY end_date DESC, created_at DESC LIMIT 1",
+        [customerId]
+      );
+      planId = String(rows[0]?.plan_id || "").trim();
+    } else {
+      planId = String(memorySubscriptionSubscribers.find((item) => item.customerId === customerId)?.planId || "").trim();
+    }
+  }
+  if (!planId) return res.status(400).json({ error: "Customer subscription plan is required." });
+  const plan = await subscriptionPlanForCheckout(planId);
+  if (!plan) return res.status(404).json({ error: "Subscription plan not found." });
+  const vehicleCount = await customerVehicleCountForSubscription([customerId]);
+  const breakdown = subscriptionPlanBreakdownServer(plan, vehicleCount);
+  const amount = Math.round(Number(breakdown.total || 0) * 100);
+  if (amount <= 0) return res.status(400).json({ error: "This subscription plan has no payable amount." });
+  const existingPaymentLink = await reusableSubscriptionPaymentLink(customerId, planId, amount);
+  if (existingPaymentLink) {
+    return res.json({
+      ok: true,
+      paymentLinkId: existingPaymentLink.id,
+      shortUrl: existingPaymentLink.shortUrl,
+      amount: existingPaymentLink.amount,
+      currency: existingPaymentLink.currency,
+      customerId,
+      planId,
+      reused: true
+    });
+  }
+  const phoneDigits = String(customer.phone || "").replace(/\D/g, "");
+  const contact = phoneDigits.length === 10 ? `+91${phoneDigits}` : phoneDigits ? `+${phoneDigits}` : "";
+  const email = String(customer.email || "").trim();
+  const paymentLink = await razorpayRequest("/payment_links", {
+    method: "POST",
+    body: JSON.stringify({
+      amount,
+      currency: "INR",
+      accept_partial: false,
+      reference_id: `sub-${customerId}-${Date.now()}`.slice(0, 40),
+      description: `${plan.name} subscription renewal`,
+      customer: {
+        name: String(customer.name || "Customer").trim(),
+        ...(contact ? { contact } : {}),
+        ...(email ? { email } : {})
+      },
+      notify: { sms: false, email: false },
+      reminder_enable: false,
+      notes: { customerId, planId, vehicleCount: String(vehicleCount) }
+    })
+  });
+  await rememberSubscriptionPaymentLink({
+    id: paymentLink.id,
+    customerId,
+    planId,
+    amount: paymentLink.amount,
+    status: paymentLink.status,
+    shortUrl: paymentLink.short_url,
+    payload: paymentLink
+  });
+  res.json({
+    ok: true,
+    paymentLinkId: paymentLink.id,
+    shortUrl: paymentLink.short_url,
+    amount: paymentLink.amount,
+    currency: paymentLink.currency,
+    customerId,
+    planId
+  });
+}));
+
 // Immediate Checkout callback verification. The webhook remains the durable
 // fallback for cases where the customer closes the browser after paying.
 app.post("/api/subscriptions/verify-payment", asyncHandler(async (req, res) => {
@@ -3632,17 +3879,29 @@ app.post("/api/razorpay/webhook", asyncHandler(async (req, res) => {
   const signature = String(req.headers["x-razorpay-signature"] || "").trim();
   if (!rawBody || !safeSignatureEqual(razorpayWebhookSignature(rawBody), signature)) return res.status(400).json({ error: "Invalid Razorpay webhook signature." });
   const event = String(req.body?.event || "");
-  if (!["order.paid", "payment.captured"].includes(event)) return res.json({ ok: true, ignored: event });
+  if (!["order.paid", "payment.captured", "payment_link.paid"].includes(event)) return res.json({ ok: true, ignored: event });
   const paymentEntity = req.body?.payload?.payment?.entity || {};
   const orderEntity = req.body?.payload?.order?.entity || {};
+  const paymentLinkEntity = req.body?.payload?.payment_link?.entity || {};
   const paymentId = String(paymentEntity.id || "").trim();
-  const orderId = String(orderEntity.id || paymentEntity.order_id || "").trim();
-  if (!paymentId || !orderId) return res.json({ ok: true, ignored: "missing payment or order id" });
-  const order = event === "order.paid" && orderEntity.id ? orderEntity : await razorpayRequest(`/orders/${encodeURIComponent(orderId)}`);
+  const paymentLinkId = String(paymentLinkEntity.id || "").trim();
+  let resolvedPaymentLink = paymentLinkEntity;
+  if (event === "payment_link.paid" && paymentLinkId && (!paymentId || !resolvedPaymentLink.notes?.customerId || !resolvedPaymentLink.notes?.planId)) {
+    resolvedPaymentLink = await razorpayRequest(`/payment_links/${encodeURIComponent(paymentLinkId)}`);
+  }
+  const resolvedPaymentId = paymentId || String(resolvedPaymentLink.payments?.[0]?.payment_id || resolvedPaymentLink.payment_id || "").trim();
+  const orderId = String(orderEntity.id || paymentEntity.order_id || resolvedPaymentLink.order_id || paymentLinkId).trim();
+  if (!resolvedPaymentId || !orderId) return res.json({ ok: true, ignored: "missing payment or order id" });
+  const order = event === "payment_link.paid"
+    ? resolvedPaymentLink
+    : event === "order.paid" && orderEntity.id
+      ? orderEntity
+      : await razorpayRequest(`/orders/${encodeURIComponent(orderId)}`);
   const customerId = String(order?.notes?.customerId || "").trim();
   const planId = String(order?.notes?.planId || "").trim();
   if (!customerId || !planId) return res.json({ ok: true, ignored: "missing subscription notes" });
-  const result = await activateSubscriptionFromPayment({ paymentId, orderId, customerId, planId, source: "webhook", payload: req.body });
+  const result = await activateSubscriptionFromPayment({ paymentId: resolvedPaymentId, orderId, customerId, planId, source: event === "payment_link.paid" ? "payment_link" : "webhook", payload: req.body });
+  if (event === "payment_link.paid") await markSubscriptionPaymentLinkPaid(paymentLinkId, req.body);
   res.json({ ok: true, alreadyProcessed: result.alreadyProcessed });
 }));
 

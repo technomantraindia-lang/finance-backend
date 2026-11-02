@@ -1,0 +1,18 @@
+:root { color-scheme: light; font-family: Arial, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #eef3f8; color: #152238; line-height: 1.6; }
+main { max-width: 860px; margin: 32px auto; padding: 0 16px; }
+article { background: #fff; border: 1px solid #d7e0ea; border-radius: 16px; padding: 32px 38px; box-shadow: 0 12px 30px rgba(21,34,56,.08); }
+h1 { margin: 0 0 8px; font-size: 32px; line-height: 1.2; }
+h2 { margin: 26px 0 8px; font-size: 20px; line-height: 1.3; }
+.brand { color: #b87500; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.date, footer { color: #5d6b7d; font-size: 14px; }
+a { color: #125da8; }
+ul { padding-left: 24px; }
+.policy-nav { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #dce5ef; font-size: 14px; }
+.policy-nav a { font-weight: 700; }
+.policy-footer { margin: 18px 0 0; color: #5d6b7d; font-size: 13px; }
+.pricing-table { border-collapse: collapse; margin: 12px 0 18px; width: 100%; }
+.pricing-table th, .pricing-table td { border: 1px solid #d7e0ea; padding: 10px 12px; text-align: left; }
+.pricing-table th { background: #f2f6fa; }
+@media (max-width: 600px) { main { margin: 16px auto; padding: 0 10px; } article { padding: 24px 20px; } h1 { font-size: 27px; } }

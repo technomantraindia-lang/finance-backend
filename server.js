@@ -160,18 +160,9 @@ app.use(express.json({
   }
 }));
 
-const policyPageFiles = {
-  "/privacy-policy": "privacy-policy.html",
-  "/terms-and-conditions": "terms-and-conditions.html",
-  "/cancellation-refund-policy": "cancellation-refund-policy.html",
-  "/service-delivery-policy": "service-delivery-policy.html",
-  "/contact-us": "contact-us.html",
-  "/pricing": "pricing.html"
-};
-Object.entries(policyPageFiles).forEach(([route, fileName]) => {
-  app.get(route, (req, res) => res.sendFile(path.join(__dirname, "policies", fileName)));
+app.get("/privacy-policy", (req, res) => {
+  res.sendFile(path.join(__dirname, "privacy-policy.html"));
 });
-app.get("/policies/policies.css", (req, res) => res.sendFile(path.join(__dirname, "policies", "policies.css")));
 
 app.get("/", (req, res) => {
   res.json({

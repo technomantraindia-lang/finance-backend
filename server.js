@@ -11,6 +11,9 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 const REQUIRE_DATABASE = process.env.REQUIRE_DATABASE !== "false";
+const RAZORPAY_KEY_ID = String(process.env.RAZORPAY_KEY_ID || "").trim();
+const RAZORPAY_KEY_SECRET = String(process.env.RAZORPAY_KEY_SECRET || "").trim();
+const RAZORPAY_WEBHOOK_SECRET = String(process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
 const DUE_MONITOR_ENABLED = process.env.DUE_MONITOR_ENABLED !== "false";
 const DUE_MONITOR_INTERVAL_HOURS = Math.max(1, Number(process.env.DUE_MONITOR_INTERVAL_HOURS || 24));
 const DUE_MONITOR_WINDOW_DAYS = Math.max(1, Number(process.env.DUE_MONITOR_WINDOW_DAYS || 30));
@@ -148,7 +151,14 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({
+  limit: "25mb",
+  verify: (req, res, buffer) => {
+    if (String(req.originalUrl || "").split("?")[0].endsWith("/api/razorpay/webhook")) {
+      req.rawBody = Buffer.from(buffer);
+    }
+  }
+}));
 
 app.get("/privacy-policy", (req, res) => {
   res.sendFile(path.join(__dirname, "privacy-policy.html"));
@@ -208,6 +218,7 @@ const memoryWhatsAppLogs = [];
 const memorySubscriptionPlans = [];
 const memorySubscriptionSubscribers = [];
 let memorySubscriptionPayment = { paymentLink: "", qrCodeUrl: "" };
+const memorySubscriptionPayments = new Set();
 const defaultRolePermissions = [
   ["View all clients", "Yes", "No", "Assigned only", "No"],
   ["View own fleet", "Yes", "Yes", "Assigned only", "Yes"],
@@ -1764,6 +1775,20 @@ async function ensureSubscriptionTables() {
       FOREIGN KEY (customer_id) REFERENCES clients(id) ON DELETE CASCADE
     )`
   );
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS subscription_payments (
+      payment_id VARCHAR(64) PRIMARY KEY,
+      order_id VARCHAR(64) NOT NULL,
+      customer_id VARCHAR(32) NOT NULL,
+      plan_id VARCHAR(64) NOT NULL,
+      status VARCHAR(24) NOT NULL DEFAULT 'processed',
+      source VARCHAR(24) NOT NULL DEFAULT 'checkout',
+      payload_json LONGTEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_subscription_payments_order (order_id),
+      INDEX idx_subscription_payments_customer (customer_id)
+    )`
+  );
 }
 
 async function ensureSubscriptionPlanColumns() {
@@ -2516,7 +2541,7 @@ async function syncScopedData(req, payload) {
 }
 
 app.use("/api", asyncHandler(async (req, res, next) => {
-  if (req.path === "/health" || req.path === "/login") return next();
+  if (req.path === "/health" || req.path === "/login" || req.path === "/razorpay/webhook") return next();
   authenticateRequest(req, res, next);
 }));
 
@@ -3310,6 +3335,150 @@ function normalizeSubscriptionDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
 }
 
+function subscriptionToday() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date());
+}
+
+function addSubscriptionDays(dateValue, days) {
+  const date = new Date(`${dateValue}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return "";
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function subscriptionEndDateForCycleServer(startDate, billingCycle) {
+  const start = new Date(`${startDate}T00:00:00Z`);
+  if (Number.isNaN(start.getTime())) return "";
+  const cycleMonths = { Monthly: 1, Quarterly: 3, Yearly: 12 }[billingCycle] || 1;
+  const target = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + cycleMonths, 1));
+  const lastTargetDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(start.getUTCDate(), lastTargetDay) - 1);
+  return target.toISOString().slice(0, 10);
+}
+
+function subscriptionPlanBreakdownServer(plan, vehicleCount) {
+  const count = Math.max(0, Math.floor(Number(vehicleCount) || 0));
+  const tiers = parseSubscriptionJson(plan?.pricing_tiers_json ?? plan?.pricingTiers, []);
+  const tier = tiers.find((item) => count >= Number(item?.min || 0) && (item?.max === null || item?.max === undefined || count <= Number(item.max)));
+  if (tier) return { vehicleCount: count, total: count * Math.max(0, Number(tier.rate || 0)) };
+  const includedVehicles = Math.max(0, Number(plan?.included_vehicles ?? plan?.includedVehicles ?? 0));
+  const extraVehicles = Math.max(0, count - includedVehicles);
+  const total = Math.max(0, Number(plan?.price || 0)) + extraVehicles * Math.max(0, Number(plan?.extra_vehicle_price ?? plan?.extraVehiclePrice ?? 0));
+  return { vehicleCount: count, total };
+}
+
+function razorpayConfigured() {
+  return Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
+}
+
+async function razorpayRequest(endpoint, options = {}) {
+  if (!razorpayConfigured()) throw new Error("Razorpay test keys are not configured on the backend.");
+  const response = await fetch(`https://api.razorpay.com/v1${endpoint}`, {
+    ...options,
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64")}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result?.error?.description || result?.error?.reason || "Razorpay request failed.");
+  return result;
+}
+
+function safeSignatureEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""));
+  const rightBuffer = Buffer.from(String(right || ""));
+  return leftBuffer.length > 0 && leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function razorpayCheckoutSignature(orderId, paymentId) {
+  return crypto.createHmac("sha256", RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest("hex");
+}
+
+function razorpayWebhookSignature(rawBody) {
+  return crypto.createHmac("sha256", RAZORPAY_WEBHOOK_SECRET).update(rawBody).digest("hex");
+}
+
+async function subscriptionCustomerContext(req) {
+  const clientIds = dbAvailable ? await mysqlClientIdsForRequest(req) : [...memoryClientIdsForRequest(req)];
+  return { clientIds, customerId: clientIds[0] || "" };
+}
+
+async function subscriptionPlanForCheckout(planId) {
+  if (!dbAvailable) return memorySubscriptionPlans.find((item) => item.id === planId) || null;
+  const [rows] = await pool.query("SELECT * FROM subscription_plans WHERE id = ? LIMIT 1", [planId]);
+  return rows[0] || null;
+}
+
+async function customerVehicleCountForSubscription(clientIds) {
+  if (!clientIds.length) return 0;
+  if (!dbAvailable) return memoryVehicles.filter((item) => clientIds.includes(item.client_id) && item.status !== "Sold").length;
+  const placeholders = clientIds.map(() => "?").join(",");
+  const [rows] = await pool.query(`SELECT COUNT(*) AS vehicle_count FROM vehicles WHERE client_id IN (${placeholders}) AND status <> 'Sold'`, clientIds);
+  return Number(rows[0]?.vehicle_count || 0);
+}
+
+async function activateSubscriptionFromPayment({ paymentId, orderId, customerId, planId, source, payload }) {
+  const today = subscriptionToday();
+  const plan = await subscriptionPlanForCheckout(planId);
+  if (!plan) throw new Error("Subscription plan not found.");
+  const billingCycle = plan.billing_cycle || plan.billingCycle || "Monthly";
+
+  if (!dbAvailable) {
+    if (memorySubscriptionPayments.has(paymentId)) return { alreadyProcessed: true };
+    memorySubscriptionPayments.add(paymentId);
+    const current = memorySubscriptionSubscribers.find((item) => item.customerId === customerId);
+    const startDate = current?.endDate && current.endDate >= today ? addSubscriptionDays(current.endDate, 1) : today;
+    const endDate = subscriptionEndDateForCycleServer(startDate, billingCycle);
+    const next = { id: current?.id || `subscription-${Date.now()}`, customerId, planId, startDate, endDate, createdAt: current?.createdAt || new Date().toISOString() };
+    const index = memorySubscriptionSubscribers.findIndex((item) => item.id === next.id);
+    if (index >= 0) memorySubscriptionSubscribers[index] = next;
+    else memorySubscriptionSubscribers.unshift(next);
+    return { alreadyProcessed: false, subscription: next };
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [paymentInsert] = await connection.query(
+      `INSERT IGNORE INTO subscription_payments (payment_id, order_id, customer_id, plan_id, status, source, payload_json)
+       VALUES (?, ?, ?, ?, 'processed', ?, ?)`,
+      [paymentId, orderId, customerId, planId, source || "checkout", JSON.stringify(payload || {})]
+    );
+    if (!paymentInsert.affectedRows) {
+      await connection.commit();
+      return { alreadyProcessed: true };
+    }
+    const [subscriberRows] = await connection.query(
+      "SELECT * FROM subscription_subscribers WHERE customer_id = ? ORDER BY end_date DESC, created_at DESC LIMIT 1",
+      [customerId]
+    );
+    const current = subscriberRows[0];
+    const startDate = current?.end_date && current.end_date >= today ? addSubscriptionDays(current.end_date, 1) : today;
+    const endDate = subscriptionEndDateForCycleServer(startDate, billingCycle);
+    const subscriberId = current?.id || `subscription-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    await connection.query(
+      `INSERT INTO subscription_subscribers (id, customer_id, plan_id, start_date, end_date)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE customer_id = VALUES(customer_id), plan_id = VALUES(plan_id), start_date = VALUES(start_date), end_date = VALUES(end_date)`,
+      [subscriberId, customerId, planId, startDate, endDate]
+    );
+    await connection.commit();
+    return { alreadyProcessed: false, subscription: { id: subscriberId, customerId, planId, startDate, endDate } };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 // Subscription workspace records are admin-only and persisted in MySQL.
 app.get("/api/subscriptions", asyncHandler(async (req, res) => {
   if (denyUnlessAdmin(req, res)) return;
@@ -3393,6 +3562,88 @@ app.get("/api/subscriptions/me", asyncHandler(async (req, res) => {
     paymentDetails: { paymentLink: paymentDetails.paymentLink || "", qrCodeUrl: paymentDetails.qrCodeUrl || "" },
     mode: "mysql"
   });
+}));
+
+// Create a trusted Razorpay order for the signed-in customer. The amount is
+// calculated from the server-side plan and vehicle count, never from the UI.
+app.post("/api/subscriptions/checkout", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
+  if (!razorpayConfigured()) return res.status(503).json({ error: "Razorpay test keys are not configured on the backend." });
+  const planId = String(req.body?.planId || "").trim();
+  if (!planId) return res.status(400).json({ error: "Subscription plan is required." });
+  const { clientIds, customerId } = await subscriptionCustomerContext(req);
+  if (!customerId) return res.status(400).json({ error: "Customer account could not be resolved." });
+  const plan = await subscriptionPlanForCheckout(planId);
+  if (!plan) return res.status(404).json({ error: "Subscription plan not found." });
+  const vehicleCount = await customerVehicleCountForSubscription(clientIds);
+  const breakdown = subscriptionPlanBreakdownServer(plan, vehicleCount);
+  const amount = Math.round(Number(breakdown.total || 0) * 100);
+  if (amount <= 0) return res.status(400).json({ error: "This subscription plan has no payable amount." });
+  const receipt = `sub_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+  const order = await razorpayRequest("/orders", {
+    method: "POST",
+    body: JSON.stringify({
+      amount,
+      currency: "INR",
+      receipt,
+      notes: { customerId, planId, vehicleCount: String(vehicleCount) }
+    })
+  });
+  res.json({
+    keyId: RAZORPAY_KEY_ID,
+    orderId: order.id,
+    amount: order.amount,
+    currency: order.currency,
+    planId,
+    planName: plan.name,
+    vehicleCount,
+    receipt
+  });
+}));
+
+// Immediate Checkout callback verification. The webhook remains the durable
+// fallback for cases where the customer closes the browser after paying.
+app.post("/api/subscriptions/verify-payment", asyncHandler(async (req, res) => {
+  if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
+  if (!razorpayConfigured()) return res.status(503).json({ error: "Razorpay test keys are not configured on the backend." });
+  const paymentId = String(req.body?.razorpay_payment_id || "").trim();
+  const orderId = String(req.body?.razorpay_order_id || "").trim();
+  const signature = String(req.body?.razorpay_signature || "").trim();
+  const planId = String(req.body?.planId || "").trim();
+  if (!paymentId || !orderId || !signature || !planId) return res.status(400).json({ error: "Razorpay payment response is incomplete." });
+  if (!safeSignatureEqual(razorpayCheckoutSignature(orderId, paymentId), signature)) return res.status(400).json({ error: "Razorpay payment signature is invalid." });
+  const { clientIds, customerId } = await subscriptionCustomerContext(req);
+  const order = await razorpayRequest(`/orders/${encodeURIComponent(orderId)}`);
+  if (String(order?.notes?.customerId || "") !== String(customerId) || String(order?.notes?.planId || "") !== planId) {
+    return res.status(403).json({ error: "Razorpay order does not belong to this customer or plan." });
+  }
+  if (order.status !== "paid") return res.status(400).json({ error: "Razorpay order is not marked paid yet." });
+  const payment = await razorpayRequest(`/payments/${encodeURIComponent(paymentId)}`);
+  if (!["captured", "authorized"].includes(String(payment.status || "").toLowerCase())) return res.status(400).json({ error: "Razorpay payment is not successful yet." });
+  const result = await activateSubscriptionFromPayment({ paymentId, orderId, customerId, planId, source: "checkout", payload: { orderId, paymentId, clientIds } });
+  res.json({ ok: true, alreadyProcessed: result.alreadyProcessed, subscription: result.subscription || null });
+}));
+
+// Razorpay calls this endpoint without our bearer token. Validate the raw
+// request body before trusting any payment state from the webhook.
+app.post("/api/razorpay/webhook", asyncHandler(async (req, res) => {
+  if (!RAZORPAY_WEBHOOK_SECRET) return res.status(503).json({ error: "RAZORPAY_WEBHOOK_SECRET is not configured on the backend." });
+  const rawBody = req.rawBody;
+  const signature = String(req.headers["x-razorpay-signature"] || "").trim();
+  if (!rawBody || !safeSignatureEqual(razorpayWebhookSignature(rawBody), signature)) return res.status(400).json({ error: "Invalid Razorpay webhook signature." });
+  const event = String(req.body?.event || "");
+  if (!["order.paid", "payment.captured"].includes(event)) return res.json({ ok: true, ignored: event });
+  const paymentEntity = req.body?.payload?.payment?.entity || {};
+  const orderEntity = req.body?.payload?.order?.entity || {};
+  const paymentId = String(paymentEntity.id || "").trim();
+  const orderId = String(orderEntity.id || paymentEntity.order_id || "").trim();
+  if (!paymentId || !orderId) return res.json({ ok: true, ignored: "missing payment or order id" });
+  const order = event === "order.paid" && orderEntity.id ? orderEntity : await razorpayRequest(`/orders/${encodeURIComponent(orderId)}`);
+  const customerId = String(order?.notes?.customerId || "").trim();
+  const planId = String(order?.notes?.planId || "").trim();
+  if (!customerId || !planId) return res.json({ ok: true, ignored: "missing subscription notes" });
+  const result = await activateSubscriptionFromPayment({ paymentId, orderId, customerId, planId, source: "webhook", payload: req.body });
+  res.json({ ok: true, alreadyProcessed: result.alreadyProcessed });
 }));
 
 app.post("/api/subscription-plans", asyncHandler(async (req, res) => {

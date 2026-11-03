@@ -3658,12 +3658,10 @@ app.get("/api/subscriptions", asyncHandler(async (req, res) => {
   });
 }));
 
-// Customers only need their own subscription status so the portal can lock
-// expired accounts without exposing the admin subscription workspace.
+// Customers only need their own subscription status.
 app.get("/api/subscriptions/me", asyncHandler(async (req, res) => {
   if (!isCustomerRequest(req)) return res.status(403).json({ error: "Customer permission required." });
   await pingDb();
-
   if (!dbAvailable) {
     const allowedClientIds = memoryClientIdsForRequest(req);
     const subscriber = memorySubscriptionSubscribers

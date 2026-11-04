@@ -4,8 +4,12 @@ const cors = require("cors");
 const crypto = require("crypto");
 const path = require("path");
 const { mountMarketplaceChat, createMysqlStore } = require("./marketplaceChat");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
+// Load the backend env file first. dotenv does not overwrite values that are
+// already present, so a hosting provider's environment variables still take
+// precedence, while local backend/.env values are not accidentally shadowed
+// by the frontend/root .env file.
 require("dotenv").config({ path: path.resolve(__dirname, ".env") });
+require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
 require("dotenv").config();
 
 const app = express();
@@ -2622,11 +2626,19 @@ app.get("/api/health", asyncHandler(async (req, res) => {
         database: dbSettings.database,
         ssl: process.env.DB_SSL === "true"
       },
+      razorpay: razorpayHealth(),
       detail: lastDbError
     });
   }
   const now = await pool.query("SELECT NOW() AS now");
-  res.json({ status: "ok", mode: "mysql", dbTime: now[0][0].now, dueMonitor: lastDueMonitorResult, callerAssignment: lastCallerAssignmentResult });
+  res.json({
+    status: "ok",
+    mode: "mysql",
+    dbTime: now[0][0].now,
+    razorpay: razorpayHealth(),
+    dueMonitor: lastDueMonitorResult,
+    callerAssignment: lastCallerAssignmentResult
+  });
 }));
 
 app.get("/api/due-monitor/status", asyncHandler(async (req, res) => {
@@ -3389,7 +3401,16 @@ function subscriptionPlanBreakdownServer(plan, vehicleCount) {
 }
 
 function razorpayConfigured() {
-  return Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
+  return /^rzp_(test|live)_[A-Za-z0-9]+$/.test(RAZORPAY_KEY_ID)
+    && RAZORPAY_KEY_SECRET.length >= 10
+    && !/^your[_-]?razorpay/i.test(RAZORPAY_KEY_SECRET);
+}
+
+function razorpayHealth() {
+  return {
+    configured: razorpayConfigured(),
+    webhookConfigured: Boolean(RAZORPAY_WEBHOOK_SECRET)
+  };
 }
 
 async function razorpayRequest(endpoint, options = {}) {
